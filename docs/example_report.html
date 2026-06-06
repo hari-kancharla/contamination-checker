@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ContamCheckr report</title>
+<style>
+:root { color-scheme: light; --ink: #17202a; --muted: #5d6873; --line: #d9dee3; --paper: #fff; --wash: #f4f6f7; --accent: #174a5c; }
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--wash); color: var(--ink); font: 15px/1.5 system-ui, sans-serif; }
+main { max-width: 1040px; margin: 40px auto; padding: 0 20px 48px; }
+header, section { background: var(--paper); border: 1px solid var(--line); border-radius: 8px; padding: 24px; margin-bottom: 18px; }
+h1, h2 { margin: 0 0 12px; line-height: 1.2; }
+h1 { font-size: 24px; }
+h2 { font-size: 18px; }
+.eyebrow { color: var(--muted); font-size: 13px; letter-spacing: .06em; text-transform: uppercase; }
+.score { color: var(--accent); font-size: 56px; font-weight: 700; letter-spacing: -.04em; }
+.meta { display: flex; flex-wrap: wrap; gap: 12px 24px; color: var(--muted); }
+table { border-collapse: collapse; width: 100%; }
+th, td { border-bottom: 1px solid var(--line); padding: 10px 8px; text-align: left; vertical-align: top; }
+th { font-weight: 600; }
+thead th { color: var(--muted); font-size: 13px; }
+.scroll { overflow-x: auto; }
+ul { margin: 8px 0 0; padding-left: 20px; }
+code { background: var(--wash); padding: 2px 5px; border-radius: 3px; }
+footer { color: var(--muted); font-size: 13px; }
+@media (max-width: 640px) { .score { font-size: 44px; } header, section { padding: 18px; } }
+</style>
+</head>
+<body>
+<main>
+<header>
+  <div class="eyebrow">Benchmark contamination evidence</div>
+  <h1>nyu-mll/glue</h1>
+  <div class="score">0.275</div>
+  <div class="meta">
+    <span>Moderate Evidence</span>
+    <span>95% interval: 0.000 to 0.275</span>
+    <span>Basis: guided_plus_order</span>
+  </div>
+  <p>This score combines available comparative evidence. It is not a yes or no claim that an example appeared in training.</p>
+</header>
+<section>
+  <h2>Capabilities</h2>
+  <table><tr><th>Supports Generation</th><td>Yes</td></tr><tr><th>Supports Logprobs</th><td>Yes</td></tr><tr><th>Supports Full Distribution</th><td>Yes</td></tr></table>
+</section>
+<section>
+  <h2>Method summary</h2>
+  <table><thead><tr><th>Method</th><th>Index</th><th>Evidence</th></tr></thead><tbody><tr><th>Guided overlap gap</th><td>0.000</td><td>ROUGE-L gap -0.011; gap interval -0.033 to 0.000</td></tr><tr><th>Min-K%++</th><td>Unavailable</td><td>AUC Unavailable; raw distribution only</td></tr><tr><th>Canonical order</th><td>0.962</td><td>Permutation p-value 0.038</td></tr></tbody></table>
+</section>
+<section>
+  <h2>Caveats</h2>
+  <ul><li>Scores are evidence signals, not proof that a training example was present.</li><li>Prompting, tokenization, model capability, and control-set quality can affect the result.</li><li>Min-K%++ is shown as a raw distribution because no usable matched control set was supplied.</li></ul>
+</section>
+<section>
+  <h2>Skipped methods</h2>
+  <ul><li>None</li></ul>
+</section>
+<section>
+  <h2>Per-example preview</h2>
+  <div class="scroll">
+  <table>
+    <thead><tr><th>ID</th><th>Guided</th><th>General</th><th>Exact</th><th>Near</th><th>Min-K%++</th></tr></thead>
+    <tbody><tr><td>0</td><td>0.000</td><td>0.000</td><td>No</td><td>No</td><td>-0.863</td></tr><tr><td>1</td><td>0.000</td><td>0.000</td><td>No</td><td>No</td><td>-0.927</td></tr><tr><td>2</td><td>0.000</td><td>0.000</td><td>No</td><td>No</td><td>-1.632</td></tr><tr><td>3</td><td>0.062</td><td>0.062</td><td>No</td><td>No</td><td>-2.290</td></tr><tr><td>4</td><td>0.000</td><td>0.111</td><td>No</td><td>No</td><td>-1.708</td></tr><tr><td>5</td><td>0.065</td><td>0.065</td><td>No</td><td>No</td><td>-1.618</td></tr><tr><td>6</td><td>0.000</td><td>0.000</td><td>No</td><td>No</td><td>-2.237</td></tr><tr><td>7</td><td>0.000</td><td>0.000</td><td>No</td><td>No</td><td>-1.838</td></tr><tr><td>8</td><td>0.059</td><td>0.059</td><td>No</td><td>No</td><td>-0.951</td></tr><tr><td>9</td><td>0.043</td><td>0.043</td><td>No</td><td>No</td><td>-2.488</td></tr></tbody>
+  </table>
+  </div>
+</section>
+<section>
+  <h2>Reproducibility</h2>
+  <p><strong>Model:</strong> <code>distilgpt2</code></p>
+  <p><strong>Benchmark:</strong> <code>nyu-mll/glue</code>, split <code>validation</code>, 10 examples</p>
+  <p><strong>Seed:</strong> 0</p>
+  <footer>contamcheck 0.1.0, torch 2.12.0, transformers 5.10.2, datasets 5.0.0, numpy 2.4.6</footer>
+</section>
+</main>
+</body>
+</html>
