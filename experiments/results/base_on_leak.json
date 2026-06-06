@@ -1,0 +1,576 @@
+{
+  "band": "low evidence",
+  "benchmark_source": "/Users/hk/Documents/Projects/ContaminationChecker/experiments/data/leak_set.jsonl",
+  "capabilities": {
+    "supports_full_distribution": true,
+    "supports_generation": true,
+    "supports_logprobs": true
+  },
+  "caveats": [
+    "Scores are evidence signals, not proof that a training example was present.",
+    "Prompting, tokenization, model capability, and control-set quality can affect the result."
+  ],
+  "confidence_interval": [
+    0.0076923076923076875,
+    0.17016802884615384
+  ],
+  "contamination_index": 0.13076923076923078,
+  "control_count": 40,
+  "control_source": "/Users/hk/Documents/Projects/ContaminationChecker/experiments/data/clean_set.jsonl",
+  "dataset_name": "leak_set",
+  "exact_gap": 0.0,
+  "example_count": 40,
+  "general_exact_rate": 0.0,
+  "general_near_rate": 0.0,
+  "general_rouge": 0.0,
+  "guided_exact_rate": 0.0,
+  "guided_gap_ci": [
+    0.0,
+    0.0
+  ],
+  "guided_general_gap": 0.0,
+  "guided_near_rate": 0.0,
+  "guided_rouge": 0.0,
+  "index_basis": "combined",
+  "index_guided": 0.0,
+  "index_minkpp": 0.0,
+  "index_order": 0.6538461538461539,
+  "library_versions": {
+    "contamcheck": "0.1.0",
+    "datasets": "5.0.0",
+    "numpy": "2.4.6",
+    "torch": "2.12.0",
+    "transformers": "5.10.2"
+  },
+  "minkpp_auc": 0.396875,
+  "minkpp_summary": {
+    "benchmark_mink": {
+      "count": 40,
+      "maximum": -10.86687684059143,
+      "mean": -10.870405930280686,
+      "median": -10.866877794265747,
+      "minimum": -10.879732370376587,
+      "standard_deviation": 0.005181315598695492
+    },
+    "benchmark_minkpp": {
+      "count": 40,
+      "maximum": -1.5149141423826835,
+      "mean": -1.7474374630960618,
+      "median": -1.9135348219661812,
+      "minimum": -2.055395037285404,
+      "standard_deviation": 0.21480648237596323
+    },
+    "control_mink": {
+      "count": 40,
+      "maximum": -10.861831283569336,
+      "mean": -10.868720318078996,
+      "median": -10.866877555847168,
+      "minimum": -10.88254165649414,
+      "standard_deviation": 0.0055794052147866945
+    },
+    "control_minkpp": {
+      "count": 40,
+      "maximum": -1.339549509061553,
+      "mean": -1.661547921913098,
+      "median": -1.5186020689825974,
+      "minimum": -2.08487625658464,
+      "standard_deviation": 0.23884975509646228
+    },
+    "uncalibrated_reason": null
+  },
+  "model_id": "sshleifer/tiny-gpt2",
+  "near_gap": 0.0,
+  "order_p_value": 0.34615384615384615,
+  "order_summary": {
+    "canonical_advantage": 0.00376953124996362,
+    "permutation_count": 25,
+    "shards": [
+      {
+        "advantage": 0.01297851562503638,
+        "canonical_ll": -2186.00146484375,
+        "example_ids": [
+          "lq-135",
+          "lq-100",
+          "lq-112",
+          "lq-124",
+          "lq-118",
+          "lq-128",
+          "lq-115",
+          "lq-119"
+        ],
+        "permuted_mean_ll": -2186.014443359375,
+        "shard": 0
+      },
+      {
+        "advantage": -0.04553710937489086,
+        "canonical_ll": -2186.815185546875,
+        "example_ids": [
+          "lq-136",
+          "lq-126",
+          "lq-130",
+          "lq-134",
+          "lq-113",
+          "lq-116",
+          "lq-137",
+          "lq-104"
+        ],
+        "permuted_mean_ll": -2186.7696484375,
+        "shard": 1
+      },
+      {
+        "advantage": 0.01563476562478172,
+        "canonical_ll": -2186.3876953125,
+        "example_ids": [
+          "lq-105",
+          "lq-133",
+          "lq-139",
+          "lq-131",
+          "lq-110",
+          "lq-106",
+          "lq-120",
+          "lq-121"
+        ],
+        "permuted_mean_ll": -2186.403330078125,
+        "shard": 2
+      },
+      {
+        "advantage": 0.08199218749996362,
+        "canonical_ll": -2186.19091796875,
+        "example_ids": [
+          "lq-101",
+          "lq-108",
+          "lq-114",
+          "lq-123",
+          "lq-102",
+          "lq-103",
+          "lq-117",
+          "lq-107"
+        ],
+        "permuted_mean_ll": -2186.27291015625,
+        "shard": 3
+      },
+      {
+        "advantage": -0.04622070312507276,
+        "canonical_ll": -2186.774658203125,
+        "example_ids": [
+          "lq-132",
+          "lq-127",
+          "lq-122",
+          "lq-125",
+          "lq-111",
+          "lq-138",
+          "lq-129",
+          "lq-109"
+        ],
+        "permuted_mean_ll": -2186.7284375,
+        "shard": 4
+      }
+    ]
+  },
+  "per_example": [
+    {
+      "general_exact": false,
+      "general_near": false,
+      "general_rouge": 0.0,
+      "guided_exact": false,
+      "guided_near": false,
+      "guided_rouge": 0.0,
+      "id": "lq-135",
+      "minkpp_score": -1.5149225116418055
+    },
+    {
+      "general_exact": false,
+      "general_near": false,
+      "general_rouge": 0.0,
+      "guided_exact": false,
+      "guided_near": false,
+      "guided_rouge": 0.0,
+      "id": "lq-100",
+      "minkpp_score": -1.9480403962036985
+    },
+    {
+      "general_exact": false,
+      "general_near": false,
+      "general_rouge": 0.0,
+      "guided_exact": false,
+      "guided_near": false,
+      "guided_rouge": 0.0,
+      "id": "lq-112",
+      "minkpp_score": -1.9480300406777202
+    },
+    {
+      "general_exact": false,
+      "general_near": false,
+      "general_rouge": 0.0,
+      "guided_exact": false,
+      "guided_near": false,
+      "guided_rouge": 0.0,
+      "id": "lq-124",
+      "minkpp_score": -1.9480400577836312
+    },
+    {
+      "general_exact": false,
+      "general_near": false,
+      "general_rouge": 0.0,
+      "guided_exact": false,
+      "guided_near": false,
+      "guided_rouge": 0.0,
+      "id": "lq-118",
+      "minkpp_score": -1.9433704283505275
+    },
+    {
+      "general_exact": false,
+      "general_near": false,
+      "general_rouge": 0.0,
+      "guided_exact": false,
+      "guided_near": false,
+      "guided_rouge": 0.0,
+      "id": "lq-128",
+      "minkpp_score": -1.9480390177628175
+    },
+    {
+      "general_exact": false,
+      "general_near": false,
+      "general_rouge": 0.0,
+      "guided_exact": false,
+      "guided_near": false,
+      "guided_rouge": 0.0,
+      "id": "lq-115",
+      "minkpp_score": -1.5149287135973808
+    },
+    {
+      "general_exact": false,
+      "general_near": false,
+      "general_rouge": 0.0,
+      "guided_exact": false,
+      "guided_near": false,
+      "guided_rouge": 0.0,
+      "id": "lq-119",
+      "minkpp_score": -1.5149371991328362
+    },
+    {
+      "general_exact": false,
+      "general_near": false,
+      "general_rouge": 0.0,
+      "guided_exact": false,
+      "guided_near": false,
+      "guided_rouge": 0.0,
+      "id": "lq-136",
+      "minkpp_score": -1.9850254194208106
+    },
+    {
+      "general_exact": false,
+      "general_near": false,
+      "general_rouge": 0.0,
+      "guided_exact": false,
+      "guided_near": false,
+      "guided_rouge": 0.0,
+      "id": "lq-126",
+      "minkpp_score": -1.9430324625356281
+    },
+    {
+      "general_exact": false,
+      "general_near": false,
+      "general_rouge": 0.0,
+      "guided_exact": false,
+      "guided_near": false,
+      "guided_rouge": 0.0,
+      "id": "lq-130",
+      "minkpp_score": -1.9434731822584412
+    },
+    {
+      "general_exact": false,
+      "general_near": false,
+      "general_rouge": 0.0,
+      "guided_exact": false,
+      "guided_near": false,
+      "guided_rouge": 0.0,
+      "id": "lq-134",
+      "minkpp_score": -1.9429373255908948
+    },
+    {
+      "general_exact": false,
+      "general_near": false,
+      "general_rouge": 0.0,
+      "guided_exact": false,
+      "guided_near": false,
+      "guided_rouge": 0.0,
+      "id": "lq-113",
+      "minkpp_score": -1.5149162169830923
+    },
+    {
+      "general_exact": false,
+      "general_near": false,
+      "general_rouge": 0.0,
+      "guided_exact": false,
+      "guided_near": false,
+      "guided_rouge": 0.0,
+      "id": "lq-116",
+      "minkpp_score": -1.9480400344731645
+    },
+    {
+      "general_exact": false,
+      "general_near": false,
+      "general_rouge": 0.0,
+      "guided_exact": false,
+      "guided_near": false,
+      "guided_rouge": 0.0,
+      "id": "lq-137",
+      "minkpp_score": -1.5222849748608447
+    },
+    {
+      "general_exact": false,
+      "general_near": false,
+      "general_rouge": 0.0,
+      "guided_exact": false,
+      "guided_near": false,
+      "guided_rouge": 0.0,
+      "id": "lq-104",
+      "minkpp_score": -1.9480488639320523
+    },
+    {
+      "general_exact": false,
+      "general_near": false,
+      "general_rouge": 0.0,
+      "guided_exact": false,
+      "guided_near": false,
+      "guided_rouge": 0.0,
+      "id": "lq-105",
+      "minkpp_score": -1.5149141666741661
+    },
+    {
+      "general_exact": false,
+      "general_near": false,
+      "general_rouge": 0.0,
+      "guided_exact": false,
+      "guided_near": false,
+      "guided_rouge": 0.0,
+      "id": "lq-133",
+      "minkpp_score": -1.5149164733960974
+    },
+    {
+      "general_exact": false,
+      "general_near": false,
+      "general_rouge": 0.0,
+      "guided_exact": false,
+      "guided_near": false,
+      "guided_rouge": 0.0,
+      "id": "lq-139",
+      "minkpp_score": -1.5149141423826835
+    },
+    {
+      "general_exact": false,
+      "general_near": false,
+      "general_rouge": 0.0,
+      "guided_exact": false,
+      "guided_near": false,
+      "guided_rouge": 0.0,
+      "id": "lq-131",
+      "minkpp_score": -1.5149203446056334
+    },
+    {
+      "general_exact": false,
+      "general_near": false,
+      "general_rouge": 0.0,
+      "guided_exact": false,
+      "guided_near": false,
+      "guided_rouge": 0.0,
+      "id": "lq-110",
+      "minkpp_score": -1.9431155037273773
+    },
+    {
+      "general_exact": false,
+      "general_near": false,
+      "general_rouge": 0.0,
+      "guided_exact": false,
+      "guided_near": false,
+      "guided_rouge": 0.0,
+      "id": "lq-106",
+      "minkpp_score": -1.9437398926625549
+    },
+    {
+      "general_exact": false,
+      "general_near": false,
+      "general_rouge": 0.0,
+      "guided_exact": false,
+      "guided_near": false,
+      "guided_rouge": 0.0,
+      "id": "lq-120",
+      "minkpp_score": -1.9480278612971165
+    },
+    {
+      "general_exact": false,
+      "general_near": false,
+      "general_rouge": 0.0,
+      "guided_exact": false,
+      "guided_near": false,
+      "guided_rouge": 0.0,
+      "id": "lq-121",
+      "minkpp_score": -1.8841323183414678
+    },
+    {
+      "general_exact": false,
+      "general_near": false,
+      "general_rouge": 0.0,
+      "guided_exact": false,
+      "guided_near": false,
+      "guided_rouge": 0.0,
+      "id": "lq-101",
+      "minkpp_score": -1.5149461040744396
+    },
+    {
+      "general_exact": false,
+      "general_near": false,
+      "general_rouge": 0.0,
+      "guided_exact": false,
+      "guided_near": false,
+      "guided_rouge": 0.0,
+      "id": "lq-108",
+      "minkpp_score": -1.9480278612971165
+    },
+    {
+      "general_exact": false,
+      "general_near": false,
+      "general_rouge": 0.0,
+      "guided_exact": false,
+      "guided_near": false,
+      "guided_rouge": 0.0,
+      "id": "lq-114",
+      "minkpp_score": -1.9430474536837314
+    },
+    {
+      "general_exact": false,
+      "general_near": false,
+      "general_rouge": 0.0,
+      "guided_exact": false,
+      "guided_near": false,
+      "guided_rouge": 0.0,
+      "id": "lq-123",
+      "minkpp_score": -1.5149371991328362
+    },
+    {
+      "general_exact": false,
+      "general_near": false,
+      "general_rouge": 0.0,
+      "guided_exact": false,
+      "guided_near": false,
+      "guided_rouge": 0.0,
+      "id": "lq-102",
+      "minkpp_score": -1.94343361615378
+    },
+    {
+      "general_exact": false,
+      "general_near": false,
+      "general_rouge": 0.0,
+      "guided_exact": false,
+      "guided_near": false,
+      "guided_rouge": 0.0,
+      "id": "lq-103",
+      "minkpp_score": -1.5149141423826835
+    },
+    {
+      "general_exact": false,
+      "general_near": false,
+      "general_rouge": 0.0,
+      "guided_exact": false,
+      "guided_near": false,
+      "guided_rouge": 0.0,
+      "id": "lq-117",
+      "minkpp_score": -1.5222876541998052
+    },
+    {
+      "general_exact": false,
+      "general_near": false,
+      "general_rouge": 0.0,
+      "guided_exact": false,
+      "guided_near": false,
+      "guided_rouge": 0.0,
+      "id": "lq-107",
+      "minkpp_score": -1.52227978310299
+    },
+    {
+      "general_exact": false,
+      "general_near": false,
+      "general_rouge": 0.0,
+      "guided_exact": false,
+      "guided_near": false,
+      "guided_rouge": 0.0,
+      "id": "lq-132",
+      "minkpp_score": -1.9480320736539085
+    },
+    {
+      "general_exact": false,
+      "general_near": false,
+      "general_rouge": 0.0,
+      "guided_exact": false,
+      "guided_near": false,
+      "guided_rouge": 0.0,
+      "id": "lq-127",
+      "minkpp_score": -1.5222853930002413
+    },
+    {
+      "general_exact": false,
+      "general_near": false,
+      "general_rouge": 0.0,
+      "guided_exact": false,
+      "guided_near": false,
+      "guided_rouge": 0.0,
+      "id": "lq-122",
+      "minkpp_score": -2.055395037285404
+    },
+    {
+      "general_exact": false,
+      "general_near": false,
+      "general_rouge": 0.0,
+      "guided_exact": false,
+      "guided_near": false,
+      "guided_rouge": 0.0,
+      "id": "lq-125",
+      "minkpp_score": -1.5149164267755229
+    },
+    {
+      "general_exact": false,
+      "general_near": false,
+      "general_rouge": 0.0,
+      "guided_exact": false,
+      "guided_near": false,
+      "guided_rouge": 0.0,
+      "id": "lq-111",
+      "minkpp_score": -1.5149142356226202
+    },
+    {
+      "general_exact": false,
+      "general_near": false,
+      "general_rouge": 0.0,
+      "guided_exact": false,
+      "guided_near": false,
+      "guided_rouge": 0.0,
+      "id": "lq-138",
+      "minkpp_score": -1.9429963327443838
+    },
+    {
+      "general_exact": false,
+      "general_near": false,
+      "general_rouge": 0.0,
+      "guided_exact": false,
+      "guided_near": false,
+      "guided_rouge": 0.0,
+      "id": "lq-129",
+      "minkpp_score": -1.6534214454574747
+    },
+    {
+      "general_exact": false,
+      "general_near": false,
+      "general_rouge": 0.0,
+      "guided_exact": false,
+      "guided_near": false,
+      "guided_rouge": 0.0,
+      "id": "lq-109",
+      "minkpp_score": -1.5149162169830923
+    }
+  ],
+  "reproduction_rate": 0.0,
+  "seed": 17,
+  "skipped_methods": [],
+  "split": "validation"
+}
