@@ -14,7 +14,7 @@ from .methods.minkpp import score_text
 
 
 def _versions() -> dict[str, str]:
-    names = ("contamcheck", "torch", "transformers", "datasets", "numpy")
+    names = ("contamcheckr", "torch", "transformers", "datasets", "numpy")
     versions: dict[str, str] = {}
     for name in names:
         try:

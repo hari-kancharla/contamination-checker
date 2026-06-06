@@ -11,13 +11,13 @@ python -m pip install -e .
 Check the local model backend:
 
 ```bash
-contamcheck capabilities --model sshleifer/tiny-gpt2
+contamcheckr capabilities --model sshleifer/tiny-gpt2
 ```
 
 Run the bundled sample benchmark:
 
 ```bash
-contamcheck run \
+contamcheckr run \
   --model sshleifer/tiny-gpt2 \
   --benchmark sample \
   --limit 10 \
@@ -31,7 +31,7 @@ contamcheck run \
 Run the interactive local interface:
 
 ```bash
-contamcheck serve --port 8000
+contamcheckr serve --port 8000
 ```
 
 Then open `http://127.0.0.1:8000`.
@@ -41,7 +41,7 @@ The server binds to loopback only. The web page displays the same report band, c
 Add the bundled matched control to calibrate Min-K%++:
 
 ```bash
-contamcheck run \
+contamcheckr run \
   --model sshleifer/tiny-gpt2 \
   --benchmark sample \
   --control sample \

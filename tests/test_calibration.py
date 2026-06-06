@@ -1,4 +1,4 @@
-from contamcheck.calibration import calibrate_minkpp, combine_indices
+from contamcheckr.calibration import calibrate_minkpp, combine_indices
 
 
 def test_index_bases_and_weights() -> None:

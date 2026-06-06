@@ -21,12 +21,12 @@ def _sample_path(filename: str) -> Path:
     if source_path.exists():
         return source_path
     installed_path = (
-        Path(sys.prefix) / "share" / "contamcheck" / "data" / filename
+        Path(sys.prefix) / "share" / "contamcheckr" / "data" / filename
     )
     if installed_path.exists():
         return installed_path
     raise ValueError(
-        "Bundled sample data is missing. Reinstall contamcheck to restore it."
+        "Bundled sample data is missing. Reinstall contamcheckr to restore it."
     )
 
 
@@ -156,7 +156,7 @@ def load_benchmark(
         return BenchmarkData(
             examples=_normalize_records(records, text_field=text_field, limit=limit),
             source="sample",
-            dataset_name="contamcheck sample control" if sample_control else "contamcheck sample",
+            dataset_name="contamcheckr sample control" if sample_control else "contamcheckr sample",
             split="sample",
         )
 

@@ -545,8 +545,8 @@ def _parse_form(body: bytes) -> dict[str, str]:
 
 
 def make_handler(state: WebState) -> type[BaseHTTPRequestHandler]:
-    class ContamCheckHandler(BaseHTTPRequestHandler):
-        server_version = "contamcheck"
+    class ContamCheckrHandler(BaseHTTPRequestHandler):
+        server_version = "contamcheckr"
 
         def log_message(self, format: str, *args: Any) -> None:
             print(f"{self.address_string()} - {format % args}")
@@ -604,12 +604,12 @@ def make_handler(state: WebState) -> type[BaseHTTPRequestHandler]:
                 "/artifacts/latest.json": (
                     state.json_path,
                     "application/json",
-                    "contamcheck-report.json",
+                    "contamcheckr-report.json",
                 ),
                 "/artifacts/latest.csv": (
                     state.csv_path,
                     "text/csv; charset=utf-8",
-                    "contamcheck-per-example.csv",
+                    "contamcheckr-per-example.csv",
                 ),
             }
             artifact = artifacts.get(path)
@@ -662,13 +662,13 @@ def make_handler(state: WebState) -> type[BaseHTTPRequestHandler]:
             state.latest_report = report
             self._redirect("/#result")
 
-    return ContamCheckHandler
+    return ContamCheckrHandler
 
 
 def run_server(
     host: str = "127.0.0.1",
     port: int = 8000,
-    output_dir: str | Path = ".contamcheck-web",
+    output_dir: str | Path = ".contamcheckr-web",
 ) -> None:
     if host not in {"127.0.0.1", "::1", "localhost"}:
         raise ValueError(

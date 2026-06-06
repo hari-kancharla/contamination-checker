@@ -3,8 +3,8 @@ from pathlib import Path
 import pytest
 import torch
 
-from contamcheck.model import ModelCapabilities
-from contamcheck.web import (
+from contamcheckr.model import ModelCapabilities
+from contamcheckr.web import (
     DEFAULT_FORM,
     WebState,
     execute_audit,

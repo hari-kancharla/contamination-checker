@@ -12,7 +12,7 @@ from .report import build_report, format_summary, write_csv, write_json
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="contamcheck",
+        prog="contamcheckr",
         description="Estimate benchmark contamination evidence for a local causal LM.",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -49,7 +49,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8000)
-    serve.add_argument("--output-dir", default=".contamcheck-web")
+    serve.add_argument("--output-dir", default=".contamcheckr-web")
     return parser
 
 
@@ -136,7 +136,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0
         return _run(args)
     except (OSError, RuntimeError, ValueError) as error:
-        print(f"contamcheck: {error}", file=sys.stderr)
+        print(f"contamcheckr: {error}", file=sys.stderr)
         return 1
 
 

@@ -3,7 +3,7 @@ import math
 import pytest
 import torch
 
-from contamcheck.methods.minkpp import score_logits
+from contamcheckr.methods.minkpp import score_logits
 
 
 def test_hand_built_logits_match_expected_scores() -> None:

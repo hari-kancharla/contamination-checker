@@ -15,15 +15,15 @@ from torch.optim import AdamW
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from contamcheck.benchmarks import BenchmarkData, load_benchmark
-from contamcheck.config import RunConfig
-from contamcheck.model import (
+from contamcheckr.benchmarks import BenchmarkData, load_benchmark
+from contamcheckr.config import RunConfig
+from contamcheckr.model import (
     LocalCausalLM,
     load_model,
     resolve_device,
     set_seed,
 )
-from contamcheck.report import build_report, write_json
+from contamcheckr.report import build_report, write_json
 
 
 ROOT = Path(__file__).resolve().parent

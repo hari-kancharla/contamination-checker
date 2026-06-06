@@ -1,12 +1,12 @@
 import pytest
 
-from contamcheck.methods.guided import (
+from contamcheckr.methods.guided import (
     build_general_prompt,
     build_guided_prompt,
     score_completion,
     split_text,
 )
-from contamcheck.model import load_model
+from contamcheckr.model import load_model
 
 
 class CharacterTokenizer:

@@ -3,11 +3,11 @@ from pathlib import Path
 import pytest
 import torch
 
-from contamcheck.benchmarks import load_benchmark
-from contamcheck.config import RunConfig
-from contamcheck.html_report import build_html
-from contamcheck.model import ModelCapabilities, load_model
-from contamcheck.report import build_report, format_summary
+from contamcheckr.benchmarks import load_benchmark
+from contamcheckr.config import RunConfig
+from contamcheckr.html_report import build_html
+from contamcheckr.model import ModelCapabilities, load_model
+from contamcheckr.report import build_report, format_summary
 
 
 class CharacterTokenizer:

@@ -36,7 +36,7 @@
   "index_minkpp": 0.0,
   "index_order": 0.6538461538461539,
   "library_versions": {
-    "contamcheck": "0.1.0",
+    "contamcheckr": "0.1.0",
     "datasets": "5.0.0",
     "numpy": "2.4.6",
     "torch": "2.12.0",

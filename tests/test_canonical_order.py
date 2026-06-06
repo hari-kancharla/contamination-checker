@@ -1,6 +1,6 @@
 import pytest
 
-from contamcheck.methods.canonical_order import canonical_order_test
+from contamcheckr.methods.canonical_order import canonical_order_test
 
 
 SEPARATOR = "\n\n---\n\n"

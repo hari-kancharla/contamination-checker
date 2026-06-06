@@ -10,7 +10,7 @@ dist/
 htmlcov/
 .DS_Store
 .cache/
-.contamcheck-web/
+.contamcheckr-web/
 experiments/models/
 huggingface/
 models/

@@ -1,6 +1,6 @@
 import pytest
 
-from contamcheck.metrics import (
+from contamcheckr.metrics import (
     auc,
     levenshtein,
     paired_bootstrap_ci,

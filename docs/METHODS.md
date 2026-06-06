@@ -1,6 +1,6 @@
 # Methods
 
-contamcheck reports evidence with uncertainty. It does not turn any method into a yes or no contamination claim.
+contamcheckr reports evidence with uncertainty. It does not turn any method into a yes or no contamination claim.
 
 ## Guided overlap gap
 

@@ -34,7 +34,7 @@ This is weak, uncertain evidence rather than a contamination finding. The interv
 The recorded command used the already cached model and dataset:
 
 ```bash
-HF_HUB_OFFLINE=1 .venv/bin/contamcheck run --model distilgpt2 --benchmark nyu-mll/glue --dataset-config sst2 --split validation --text-field sentence --limit 10 --device cpu --output docs/example_report.json --csv docs/example_per_example.csv --html docs/example_report.html
+HF_HUB_OFFLINE=1 .venv/bin/contamcheckr run --model distilgpt2 --benchmark nyu-mll/glue --dataset-config sst2 --split validation --text-field sentence --limit 10 --device cpu --output docs/example_report.json --csv docs/example_per_example.csv --html docs/example_report.html
 ```
 
 Remove `HF_HUB_OFFLINE=1` when the model or dataset is not cached.
@@ -48,7 +48,7 @@ Captured artifacts:
 For a larger GPU run with a less fragile order test:
 
 ```bash
-contamcheck run --model EleutherAI/pythia-1.4b --benchmark nyu-mll/glue --dataset-config sst2 --split validation --text-field sentence --limit 100 --device cuda --output pythia_glue_report.json --csv pythia_glue_per_example.csv --html pythia_glue_report.html
+contamcheckr run --model EleutherAI/pythia-1.4b --benchmark nyu-mll/glue --dataset-config sst2 --split validation --text-field sentence --limit 100 --device cuda --output pythia_glue_report.json --csv pythia_glue_per_example.csv --html pythia_glue_report.html
 ```
 
 A larger model and sample improve the audit conditions, but they do not guarantee a higher contamination score.

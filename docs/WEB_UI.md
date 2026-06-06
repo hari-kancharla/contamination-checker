@@ -1,11 +1,11 @@
 # Local web interface
 
-The web interface runs the same audit code as `contamcheck run`. It does not have a separate scoring path.
+The web interface runs the same audit code as `contamcheckr run`. It does not have a separate scoring path.
 
 Start it with:
 
 ```bash
-contamcheck serve --port 8000
+contamcheckr serve --port 8000
 ```
 
 Open `http://127.0.0.1:8000`. The server accepts only `127.0.0.1`, `::1`, or `localhost` as bind hosts. It rejects `0.0.0.0` and other network-facing addresses.
@@ -42,7 +42,7 @@ The page links to:
 - `latest.csv`, the per-example table
 - the standalone HTML report
 
-Files are written under `.contamcheck-web/` by default. Use `--output-dir` to choose another local directory.
+Files are written under `.contamcheckr-web/` by default. Use `--output-dir` to choose another local directory.
 
 ## Network behavior
 
