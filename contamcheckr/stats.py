@@ -196,3 +196,80 @@ def student_t_ppf(probability: float, degrees_of_freedom: float) -> float:
         else:
             high = middle
     return 0.5 * (low + high)
+
+
+# ---------------------------------------------------------------------------
+# Effect sizes and confidence intervals
+# ---------------------------------------------------------------------------
+
+
+def mean_ci(
+    values: Sequence[float],
+    *,
+    confidence: float = 0.95,
+) -> tuple[float, float] | None:
+    """Student-t confidence interval for a mean."""
+    array = _as_float_array(values, name="values")
+    if len(array) < 2:
+        return None
+    if not 0.0 < confidence < 1.0:
+        raise ValueError("Confidence must be between 0 and 1.")
+    standard_error = float(np.std(array, ddof=1)) / math.sqrt(len(array))
+    if standard_error == 0.0:
+        return float(np.mean(array)), float(np.mean(array))
+    critical = student_t_ppf(0.5 + confidence / 2.0, len(array) - 1)
+    center = float(np.mean(array))
+    return center - critical * standard_error, center + critical * standard_error
+
+
+def one_sided_t_test(
+    values: Sequence[float],
+    *,
+    null_mean: float = 0.0,
+) -> dict[str, float]:
+    """One-sided t-test for ``mean(values) > null_mean``."""
+    array = _as_float_array(values, name="values")
+    if len(array) < 2:
+        raise ValueError("A t-test requires at least two observations.")
+    center = float(np.mean(array))
+    standard_deviation = float(np.std(array, ddof=1))
+    if standard_deviation == 0.0:
+        if center > null_mean:
+            return {"statistic": math.inf, "p_value": 0.0, "df": len(array) - 1.0}
+        return {"statistic": 0.0, "p_value": 1.0, "df": len(array) - 1.0}
+    statistic = (center - null_mean) / (standard_deviation / math.sqrt(len(array)))
+    p_value = student_t_sf(statistic, len(array) - 1)
+    return {
+        "statistic": float(statistic),
+        "p_value": float(p_value),
+        "df": float(len(array) - 1),
+    }
+
+
+def cohen_dz(differences: Sequence[float]) -> float:
+    """Paired standardized mean difference (Cohen's dz)."""
+    array = _as_float_array(differences, name="differences")
+    if len(array) < 2:
+        return 0.0
+    standard_deviation = float(np.std(array, ddof=1))
+    if standard_deviation == 0.0:
+        return 0.0
+    return float(np.mean(array)) / standard_deviation
+
+
+def cohen_d(left: Sequence[float], right: Sequence[float]) -> float:
+    """Pooled two-sample standardized mean difference."""
+    left_array = _as_float_array(left, name="left")
+    right_array = _as_float_array(right, name="right")
+    if len(left_array) < 2 or len(right_array) < 2:
+        return 0.0
+    left_variance = float(np.var(left_array, ddof=1))
+    right_variance = float(np.var(right_array, ddof=1))
+    pooled = math.sqrt(
+        ((len(left_array) - 1) * left_variance
+         + (len(right_array) - 1) * right_variance)
+        / (len(left_array) + len(right_array) - 2)
+    )
+    if pooled == 0.0:
+        return 0.0
+    return (float(np.mean(left_array)) - float(np.mean(right_array))) / pooled
