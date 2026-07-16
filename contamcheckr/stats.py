@@ -751,3 +751,201 @@ def posterior_probability(
     prior_odds = prior_probability / (1.0 - prior_probability)
     posterior_odds = prior_odds * bayes_factor
     return float(posterior_odds / (1.0 + posterior_odds))
+
+
+# ---------------------------------------------------------------------------
+# Bootstrap
+# ---------------------------------------------------------------------------
+
+
+def bootstrap_ci(
+    values: Sequence[float],
+    *,
+    statistic: Callable[[np.ndarray], float] | None = None,
+    samples: int = 2_000,
+    confidence: float = 0.95,
+    seed: int = 0,
+    bca: bool = True,
+) -> tuple[float, float] | None:
+    """Bootstrap confidence interval, percentile or BCa."""
+    array = _as_float_array(values, name="values")
+    if len(array) < 2:
+        return None
+    if samples < 1:
+        raise ValueError("Bootstrap sample count must be at least one.")
+    if not 0.0 < confidence < 1.0:
+        raise ValueError("Confidence must be between 0 and 1.")
+    if statistic is None:
+        statistic = lambda sample: float(np.mean(sample))  # noqa: E731
+    observed = float(statistic(array))
+    rng = np.random.default_rng(seed)
+    estimates = np.empty(samples, dtype=float)
+    for index in range(samples):
+        selected = rng.integers(0, len(array), len(array))
+        estimates[index] = float(statistic(array[selected]))
+    alpha = (1.0 - confidence) / 2.0
+    if not bca or len(np.unique(estimates)) < 2:
+        low, high = np.quantile(estimates, [alpha, 1.0 - alpha])
+        return float(low), float(high)
+    proportion_below = float(np.mean(estimates < observed))
+    proportion_below = min(max(proportion_below, 1.0 / (samples + 1)), 1.0 - 1.0 / (samples + 1))
+    z_zero = normal_ppf(proportion_below)
+    jackknife = np.empty(len(array), dtype=float)
+    for index in range(len(array)):
+        jackknife[index] = float(statistic(np.delete(array, index)))
+    jackknife_mean = float(np.mean(jackknife))
+    deviations = jackknife_mean - jackknife
+    denominator = 6.0 * float(np.sum(deviations ** 2)) ** 1.5
+    acceleration = (
+        float(np.sum(deviations ** 3)) / denominator if denominator != 0.0 else 0.0
+    )
+    z_low = normal_ppf(alpha)
+    z_high = normal_ppf(1.0 - alpha)
+    adjusted_low = normal_cdf(
+        z_zero + (z_zero + z_low) / (1.0 - acceleration * (z_zero + z_low))
+    )
+    adjusted_high = normal_cdf(
+        z_zero + (z_zero + z_high) / (1.0 - acceleration * (z_zero + z_high))
+    )
+    adjusted_low = min(max(adjusted_low, 1.0 / (samples + 1)), 1.0 - 1.0 / (samples + 1))
+    adjusted_high = min(max(adjusted_high, 1.0 / (samples + 1)), 1.0 - 1.0 / (samples + 1))
+    low, high = np.quantile(estimates, [adjusted_low, adjusted_high])
+    return float(low), float(high)
+
+
+def paired_bootstrap_ci(
+    left: Sequence[float],
+    right: Sequence[float],
+    *,
+    samples: int = 2_000,
+    confidence: float = 0.95,
+    seed: int = 0,
+    statistic: Callable[[np.ndarray, np.ndarray], float] | None = None,
+) -> tuple[float, float] | None:
+    """Paired bootstrap interval for a two-sample statistic."""
+    left_array = _as_float_array(left, name="left")
+    right_array = _as_float_array(right, name="right")
+    if len(left_array) != len(right_array):
+        raise ValueError("Paired bootstrap inputs must have equal length.")
+    if len(left_array) < 2:
+        return None
+    if statistic is None:
+        statistic = lambda a, b: float(np.mean(a - b))  # noqa: E731
+    rng = np.random.default_rng(seed)
+    estimates = np.empty(samples, dtype=float)
+    for index in range(samples):
+        selected = rng.integers(0, len(left_array), len(left_array))
+        estimates[index] = float(
+            statistic(left_array[selected], right_array[selected])
+        )
+    alpha = (1.0 - confidence) / 2.0
+    low, high = np.quantile(estimates, [alpha, 1.0 - alpha])
+    return float(low), float(high)
+
+
+# ---------------------------------------------------------------------------
+# Design diagnostics
+# ---------------------------------------------------------------------------
+
+
+def minimum_detectable_effect(
+    benchmark_count: int,
+    control_count: int,
+    *,
+    alpha: float = 0.05,
+    power: float = 0.8,
+) -> float | None:
+    """Standardized mean difference detectable with a two-sample z-test.
+
+    This is a design approximation for the ensemble score.  It ignores the
+    dependence between methods and the permutation test's finite Monte Carlo
+    resolution; report it as a planning aid, not a guarantee.
+    """
+    if benchmark_count < 2 or control_count < 2:
+        return None
+    if not 0.0 < alpha < 1.0 or not 0.0 < power < 1.0:
+        raise ValueError("Alpha and power must be between 0 and 1.")
+    z_alpha = normal_ppf(1.0 - alpha / 2.0)
+    z_power = normal_ppf(power)
+    return float((z_alpha + z_power) * math.sqrt(1.0 / benchmark_count + 1.0 / control_count))
+
+
+def pearson_correlation(left: Sequence[float], right: Sequence[float]) -> float | None:
+    """Pearson correlation, or ``None`` for degenerate input."""
+    left_array = _as_float_array(left, name="left")
+    right_array = _as_float_array(right, name="right")
+    if len(left_array) != len(right_array) or len(left_array) < 2:
+        return None
+    left_centered = left_array - np.mean(left_array)
+    right_centered = right_array - np.mean(right_array)
+    denominator = float(
+        np.sqrt(np.sum(left_centered ** 2) * np.sum(right_centered ** 2))
+    )
+    if denominator == 0.0:
+        return None
+    return float(np.sum(left_centered * right_centered) / denominator)
+
+
+def spearman_correlation(left: Sequence[float], right: Sequence[float]) -> float | None:
+    """Spearman rank correlation."""
+    left_array = _as_float_array(left, name="left")
+    right_array = _as_float_array(right, name="right")
+    if len(left_array) != len(right_array) or len(left_array) < 2:
+        return None
+    return pearson_correlation(rankdata(left_array), rankdata(right_array))
+
+
+def tpr_at_fpr(
+    positive: Sequence[float],
+    negative: Sequence[float],
+    rates: Sequence[float] = (0.01, 0.05, 0.10),
+) -> dict[str, float]:
+    """True-positive rate at fixed false-positive rates (negative quantiles).
+
+    The threshold for each rate is the ``1 - rate`` quantile of the
+    negative (control) scores; TPR is the fraction of positive
+    (benchmark) scores strictly above it.  Deterministic and
+    distribution-free; with small control sets the nominal rate is
+    coarse (e.g. 10 controls cannot resolve 1%).  Rates outside (0, 1)
+    raise ``ValueError``.
+    """
+    positive_array = _as_float_array(positive, name="positive")
+    negative_array = _as_float_array(negative, name="negative")
+    if len(positive_array) == 0 or len(negative_array) == 0:
+        raise ValueError("TPR-at-FPR requires both positive and negative scores.")
+    result: dict[str, float] = {}
+    for rate in rates:
+        value = float(rate)
+        if not 0.0 < value < 1.0:
+            raise ValueError("FPR rates must lie strictly between 0 and 1.")
+        threshold = float(np.quantile(negative_array, 1.0 - value))
+        result[f"tpr_at_fpr_{value:g}"] = float(
+            np.mean(positive_array > threshold)
+        )
+    return result
+
+
+def effective_sample_size(
+    observations: Sequence[float] | int,
+    correlations: Sequence[float] | None = None,
+) -> float | None:
+    """Effective sample size under a constant intraclass correlation.
+
+    ``n_eff = n / (1 + (n - 1) * rho)`` for a positive average correlation.
+    Accepts either the observation count ``n`` plus a correlation list, or
+    a single correlation list (whose length is ``n``).  Returns ``None`` when
+    no positive correlation is supplied.
+    """
+    if isinstance(observations, int):
+        count = observations
+        corr_list = list(correlations or [])
+    else:
+        corr_list = list(observations)
+        count = len(corr_list)
+    values = [float(value) for value in corr_list if math.isfinite(value)]
+    if count < 2 or not values:
+        return None
+    mean_correlation = float(np.mean(values))
+    if mean_correlation <= 0.0:
+        return None
+    return float(count / (1.0 + (count - 1) * mean_correlation))
