@@ -1,4 +1,0 @@
-run,description,contamination_index,band,index_guided,guided_general_gap,index_minkpp,minkpp_auc,index_order,order_p_value
-contaminated_on_leak,adapted model on leak set,0.49230769230769234,moderate evidence,0.0,0.0,1.0,1.0,0.9615384615384616,0.038461538461538464
-contaminated_on_clean,adapted model on clean set,0.0076923076923076875,low evidence,0.0,0.0,0.0,0.5,0.038461538461538436,0.9615384615384616
-base_on_leak,base model on leak set,0.13076923076923078,low evidence,0.0,0.0,0.0,0.396875,0.6538461538461539,0.34615384615384615
