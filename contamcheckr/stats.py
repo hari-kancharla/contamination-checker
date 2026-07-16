@@ -352,3 +352,224 @@ def auc_de_long_ci(
         "positive_count": float(positive_count),
         "negative_count": float(negative_count),
     }
+
+
+# ---------------------------------------------------------------------------
+# Paired and two-sample tests
+# ---------------------------------------------------------------------------
+
+
+def sign_test_p(
+    differences: Sequence[float],
+    *,
+    alternative: str = "greater",
+) -> float:
+    """Exact sign test for the median of paired differences."""
+    array = _as_float_array(differences, name="differences")
+    nonzero = array[array != 0.0]
+    if len(nonzero) == 0:
+        return 1.0
+    positives = int(np.sum(nonzero > 0.0))
+    negatives = len(nonzero) - positives
+    if alternative == "greater":
+        tail = positives
+        return float(
+            sum(
+                math.comb(len(nonzero), index)
+                for index in range(tail, len(nonzero) + 1)
+            )
+            / (2 ** len(nonzero))
+        )
+    if alternative == "less":
+        tail = negatives
+        return float(
+            sum(
+                math.comb(len(nonzero), index)
+                for index in range(tail, len(nonzero) + 1)
+            )
+            / (2 ** len(nonzero))
+        )
+    if alternative == "two-sided":
+        observed = max(positives, negatives)
+        return float(
+            min(
+                1.0,
+                2.0
+                * sum(
+                    math.comb(len(nonzero), index)
+                    for index in range(observed, len(nonzero) + 1)
+                )
+                / (2 ** len(nonzero)),
+            )
+        )
+    raise ValueError("Alternative must be greater, less, or two-sided.")
+
+
+def paired_permutation_test(
+    differences: Sequence[float],
+    *,
+    permutations: int = 10_000,
+    seed: int = 0,
+    alternative: str = "greater",
+) -> dict[str, float]:
+    """Randomization test that flips the sign of each paired difference."""
+    array = _as_float_array(differences, name="differences")
+    if len(array) == 0:
+        raise ValueError("Permutation test requires at least one difference.")
+    if permutations < 1:
+        raise ValueError("Permutation count must be at least one.")
+    observed = float(np.mean(array))
+    rng = np.random.default_rng(seed)
+    exceed = 0
+    for _ in range(permutations):
+        signs = rng.integers(0, 2, len(array), dtype=np.int8) * 2 - 1
+        statistic = float(np.mean(array * signs))
+        if alternative == "greater":
+            exceed += statistic >= observed
+        elif alternative == "less":
+            exceed += statistic <= observed
+        elif alternative == "two-sided":
+            exceed += abs(statistic) >= abs(observed)
+        else:
+            raise ValueError("Alternative must be greater, less, or two-sided.")
+    return {
+        "statistic": observed,
+        "p_value": float((1 + exceed) / (permutations + 1)),
+    }
+
+
+def permutation_test_two_sample(
+    left: Sequence[float],
+    right: Sequence[float],
+    *,
+    statistic: Callable[[np.ndarray, np.ndarray], float] | None = None,
+    permutations: int = 10_000,
+    seed: int = 0,
+    alternative: str = "greater",
+) -> dict[str, float]:
+    """Label-permutation test for a two-sample statistic."""
+    left_array = _as_float_array(left, name="left")
+    right_array = _as_float_array(right, name="right")
+    if len(left_array) == 0 or len(right_array) == 0:
+        raise ValueError("Two-sample test requires both groups.")
+    if permutations < 1:
+        raise ValueError("Permutation count must be at least one.")
+    if statistic is None:
+        statistic = lambda a, b: float(np.mean(a) - np.mean(b))  # noqa: E731
+    observed = float(statistic(left_array, right_array))
+    pooled = np.concatenate([left_array, right_array])
+    left_count = len(left_array)
+    rng = np.random.default_rng(seed)
+    exceed = 0
+    for _ in range(permutations):
+        order = rng.permutation(len(pooled))
+        permuted_left = pooled[order[:left_count]]
+        permuted_right = pooled[order[left_count:]]
+        value = float(statistic(permuted_left, permuted_right))
+        if alternative == "greater":
+            exceed += value >= observed
+        elif alternative == "less":
+            exceed += value <= observed
+        elif alternative == "two-sided":
+            exceed += abs(value) >= abs(observed)
+        else:
+            raise ValueError("Alternative must be greater, less, or two-sided.")
+    return {
+        "statistic": observed,
+        "p_value": float((1 + exceed) / (permutations + 1)),
+    }
+
+
+def mann_whitney_u_test(
+    positive: Sequence[float],
+    negative: Sequence[float],
+    *,
+    alternative: str = "greater",
+) -> dict[str, float | int | str | None]:
+    """Test equal score distributions under exchangeable group labels.
+
+    Enumerate all label assignments when their number is at most 100,000.
+    Unlike the usual no-ties U table, this conditional permutation test also
+    handles tied scores.  Larger problems use a tie-corrected normal
+    approximation without a continuity correction.  ``method`` identifies
+    which calculation was used; neither calculation establishes that the
+    groups are exchangeable or that a shift is caused by contamination.
+    """
+    if alternative not in {"greater", "less", "two-sided"}:
+        raise ValueError("Alternative must be greater, less, or two-sided.")
+    positive_array = _as_float_array(positive, name="positive")
+    negative_array = _as_float_array(negative, name="negative")
+    if len(positive_array) == 0 or len(negative_array) == 0:
+        raise ValueError("Mann-Whitney requires both groups.")
+    combined = np.concatenate([positive_array, negative_array])
+    ranks = rankdata(combined)
+    positive_count = len(positive_array)
+    negative_count = len(negative_array)
+    rank_sum = float(np.sum(ranks[:positive_count]))
+    u_value = rank_sum - positive_count * (positive_count + 1) / 2.0
+    mean_u = positive_count * negative_count / 2.0
+    label_assignments = math.comb(len(combined), positive_count)
+    if label_assignments <= 100_000:
+        # Average ranks are integers or half-integers.  Doubling them makes
+        # inclusive tail comparisons exact, including at tied observations.
+        doubled_ranks = [int(round(2.0 * rank)) for rank in ranks]
+        observed_sum = sum(doubled_ranks[:positive_count])
+        total_rank_sum = sum(doubled_ranks)
+        smaller_count = min(positive_count, negative_count)
+        upper = lower = 0
+        for assignment in itertools.combinations(range(len(combined)), smaller_count):
+            selected_sum = sum(doubled_ranks[index] for index in assignment)
+            candidate_sum = (
+                selected_sum
+                if positive_count <= negative_count
+                else total_rank_sum - selected_sum
+            )
+            upper += candidate_sum >= observed_sum
+            lower += candidate_sum <= observed_sum
+        if alternative == "greater":
+            p_value = upper / label_assignments
+        elif alternative == "less":
+            p_value = lower / label_assignments
+        else:
+            # Doubled smaller inclusive tail, conservatively capped at one.
+            p_value = min(1.0, 2.0 * min(upper, lower) / label_assignments)
+        return {
+            "u": float(u_value),
+            "p_value": float(p_value),
+            "auc": float(u_value / (positive_count * negative_count)),
+            "method": "exact_label_permutation",
+            "label_assignments": label_assignments,
+        }
+    _, counts = np.unique(combined, return_counts=True)
+    tie_correction = float(
+        np.sum(counts.astype(float) ** 3 - counts.astype(float))
+        / (len(combined) * (len(combined) - 1))
+    ) if len(combined) > 1 else 0.0
+    variance = (
+        positive_count
+        * negative_count
+        / 12.0
+        * ((len(combined) + 1) - tie_correction)
+    )
+    if variance <= 0.0:
+        return {
+            "u": float(u_value),
+            "p_value": 1.0,
+            "auc": 0.5,
+            "method": "degenerate_all_ties",
+            "label_assignments": None,
+        }
+    z_value = (u_value - mean_u) / math.sqrt(variance)
+    if alternative == "greater":
+        p_value = 0.5 * math.erfc(z_value / math.sqrt(2.0))
+    elif alternative == "less":
+        p_value = 0.5 * math.erfc(-z_value / math.sqrt(2.0))
+    else:
+        p_value = math.erfc(abs(z_value) / math.sqrt(2.0))
+    return {
+        "u": float(u_value),
+        "p_value": float(clamp(p_value)),
+        "auc": float(u_value / (positive_count * negative_count)),
+        "method": "tie_corrected_normal_approximation",
+        "label_assignments": None,
+    }
