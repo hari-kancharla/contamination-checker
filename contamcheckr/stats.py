@@ -573,3 +573,69 @@ def mann_whitney_u_test(
         "method": "tie_corrected_normal_approximation",
         "label_assignments": None,
     }
+
+
+# ---------------------------------------------------------------------------
+# P-value combination and multiple testing
+# ---------------------------------------------------------------------------
+
+
+def _validated_pvalues(pvalues: Sequence[float]) -> np.ndarray:
+    array = _as_float_array(pvalues, name="pvalues")
+    if len(array) == 0:
+        raise ValueError("At least one p-value is required.")
+    if np.any(array < 0.0) or np.any(array > 1.0):
+        raise ValueError("P-values must lie in [0, 1].")
+    return array
+
+
+def cauchy_combination(
+    pvalues: Sequence[float],
+    *,
+    weights: Sequence[float] | None = None,
+) -> float:
+    """Cauchy combination test, robust to arbitrary dependence.
+
+    Liu & Xie (2020).  The test statistic is a weighted sum of
+    ``tan((0.5 - p) * pi)``; its null distribution is standard Cauchy.
+    """
+    array = _validated_pvalues(pvalues)
+    if weights is None:
+        weight_array = np.ones(len(array), dtype=float)
+    else:
+        weight_array = _as_float_array(weights, name="weights")
+        if len(weight_array) != len(array):
+            raise ValueError("Weights must match the number of p-values.")
+        if np.any(weight_array < 0.0) or float(np.sum(weight_array)) <= 0.0:
+            raise ValueError("Weights must be non-negative with a positive sum.")
+    weight_array = weight_array / float(np.sum(weight_array))
+    if np.any(array <= 0.0):
+        return 0.0
+    terms = weight_array * np.tan((0.5 - array) * math.pi)
+    statistic = float(np.sum(terms))
+    combined = 0.5 - math.atan(statistic) / math.pi
+    return float(clamp(combined))
+
+
+def fisher_combination(pvalues: Sequence[float]) -> float:
+    """Fisher's method.  Assumes independence or positive dependence."""
+    array = _validated_pvalues(pvalues)
+    if np.any(array <= 0.0):
+        return 0.0
+    statistic = float(-2.0 * np.sum(np.log(array)))
+    return float(clamp(regularized_upper_gamma(len(array), statistic / 2.0)))
+
+
+def simes_combination(pvalues: Sequence[float]) -> float:
+    """Simes' test, valid under positive regression dependence."""
+    array = _validated_pvalues(pvalues)
+    ordered = np.sort(array)
+    count = len(ordered)
+    values = ordered * count / np.arange(1, count + 1)
+    return float(clamp(float(np.min(values))))
+
+
+def bonferroni_combination(pvalues: Sequence[float]) -> float:
+    """Bonferroni correction; valid under any dependence."""
+    array = _validated_pvalues(pvalues)
+    return float(clamp(float(np.min(array)) * len(array)))
