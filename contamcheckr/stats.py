@@ -98,3 +98,51 @@ def regularized_incomplete_beta(a: float, b: float, x: float) -> float:
     if x < (a + 1.0) / (a + b + 2.0):
         return front * _betacf(a, b, x) / a
     return 1.0 - front * _betacf(b, a, 1.0 - x) / b
+
+
+def _gammainc_series(a: float, x: float) -> float:
+    if x <= 0.0:
+        return 0.0
+    ap = a
+    total = 1.0 / a
+    delta = total
+    for _ in range(1, 1000):
+        ap += 1.0
+        delta *= x / ap
+        total += delta
+        if abs(delta) < abs(total) * _EPS:
+            break
+    return total * math.exp(-x + a * math.log(x) - math.lgamma(a))
+
+
+def _gammaincc_cf(a: float, x: float) -> float:
+    b = x + 1.0 - a
+    c = 1.0 / _FPMIN
+    d = 1.0 / b if abs(b) > _FPMIN else 1.0 / _FPMIN
+    h = d
+    for i in range(1, 1000):
+        an = -i * (i - a)
+        b += 2.0
+        d = an * d + b
+        if abs(d) < _FPMIN:
+            d = _FPMIN
+        c = b + an / c
+        if abs(c) < _FPMIN:
+            c = _FPMIN
+        d = 1.0 / d
+        delta = d * c
+        h *= delta
+        if abs(delta - 1.0) < _EPS:
+            break
+    return math.exp(-x + a * math.log(x) - math.lgamma(a)) * h
+
+
+def regularized_upper_gamma(a: float, x: float) -> float:
+    """Regularized upper incomplete gamma function ``Q(a, x)``."""
+    if a <= 0.0:
+        raise ValueError("Gamma shape must be positive.")
+    if x <= 0.0:
+        return 1.0
+    if x < a + 1.0:
+        return 1.0 - _gammainc_series(a, x)
+    return _gammaincc_cf(a, x)
