@@ -146,3 +146,53 @@ def regularized_upper_gamma(a: float, x: float) -> float:
     if x < a + 1.0:
         return 1.0 - _gammainc_series(a, x)
     return _gammaincc_cf(a, x)
+
+
+def normal_ppf(probability: float) -> float:
+    """Inverse standard normal CDF."""
+    if not 0.0 < probability < 1.0:
+        raise ValueError("Probability must be strictly between 0 and 1.")
+    return float(_NORMAL.inv_cdf(probability))
+
+
+def normal_cdf(value: float) -> float:
+    """Standard normal CDF."""
+    return float(_NORMAL.cdf(value))
+
+
+def student_t_sf(value: float, degrees_of_freedom: float) -> float:
+    """Survival function ``P(T > value)`` for a Student t distribution."""
+    if degrees_of_freedom <= 0.0:
+        raise ValueError("Degrees of freedom must be positive.")
+    if not math.isfinite(value):
+        return 0.0 if value > 0 else 1.0
+    if value == 0.0:
+        return 0.5
+    x = degrees_of_freedom / (degrees_of_freedom + value * value)
+    tail = 0.5 * regularized_incomplete_beta(
+        degrees_of_freedom / 2.0, 0.5, x
+    )
+    return tail if value > 0 else 1.0 - tail
+
+
+def student_t_cdf(value: float, degrees_of_freedom: float) -> float:
+    """CDF of a Student t distribution."""
+    return 1.0 - student_t_sf(value, degrees_of_freedom)
+
+
+def student_t_ppf(probability: float, degrees_of_freedom: float) -> float:
+    """Quantile of a Student t distribution via monotone bisection."""
+    if not 0.0 < probability < 1.0:
+        raise ValueError("Probability must be strictly between 0 and 1.")
+    if degrees_of_freedom <= 0.0:
+        raise ValueError("Degrees of freedom must be positive.")
+    if degrees_of_freedom > 1_000_000:
+        return normal_ppf(probability)
+    low, high = -1.0e4, 1.0e4
+    for _ in range(200):
+        middle = 0.5 * (low + high)
+        if student_t_cdf(middle, degrees_of_freedom) < probability:
+            low = middle
+        else:
+            high = middle
+    return 0.5 * (low + high)
