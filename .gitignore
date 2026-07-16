@@ -10,8 +10,11 @@ dist/
 htmlcov/
 .DS_Store
 .cache/
+.local/
 .contamcheckr-web/
 experiments/models/
+experiments/results/
+experiments/results/randomized-*/**/adapted_model/
 huggingface/
 models/
 datasets/
