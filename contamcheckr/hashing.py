@@ -145,3 +145,89 @@ def local_model_signature(model_id: str) -> dict[str, Any] | None:
         "identity_kind": "file_size_and_mtime_signature",
         "cryptographic_weights": False,
     }
+
+
+def resolved_commit_hash(loaded: Any) -> str | None:
+    """Return the resolved Hub commit exposed by a loaded model/tokenizer."""
+    candidates = [
+        getattr(getattr(loaded, "config", None), "_commit_hash", None),
+        getattr(loaded, "_commit_hash", None),
+    ]
+    init_kwargs = getattr(loaded, "init_kwargs", None)
+    if isinstance(init_kwargs, dict):
+        candidates.append(init_kwargs.get("_commit_hash"))
+    return next((value for value in candidates if isinstance(value, str) and value), None)
+
+
+def tokenizer_fingerprint(tokenizer: Any) -> str:
+    """Fingerprint vocabulary and exposed tokenization processing rules.
+
+    Fast-tokenizer serialization contains merges, normalizers, and the
+    pre/post processors.  Slow BPE and SentencePiece tokenizers expose
+    equivalent rules through different APIs.  Exotic tokenizers that expose
+    none of these remain a best-effort identity rather than a proof.
+    """
+    pieces: list[str] = [
+        str(getattr(tokenizer, "name_or_path", "")),
+        str(getattr(tokenizer, "vocab_size", "")),
+        str(getattr(tokenizer, "model_max_length", "")),
+        str(getattr(tokenizer, "pad_token_id", "")),
+        str(getattr(tokenizer, "eos_token_id", "")),
+        str(getattr(tokenizer, "bos_token_id", "")),
+        str(getattr(tokenizer, "unk_token_id", "")),
+        str(getattr(tokenizer, "padding_side", "")),
+        str(getattr(tokenizer, "truncation_side", "")),
+        str(getattr(tokenizer, "chat_template", "")),
+        str(resolved_commit_hash(tokenizer) or ""),
+    ]
+    try:
+        vocabulary = tokenizer.get_vocab()
+    except Exception:  # pragma: no cover - exotic tokenizers
+        vocabulary = {}
+    if vocabulary:
+        digest = hashlib.sha256()
+        for token, identifier in sorted(vocabulary.items()):
+            digest.update(str(token).encode("utf-8"))
+            digest.update(b"\x00")
+            digest.update(str(identifier).encode("utf-8"))
+            digest.update(b"\x01")
+        pieces.append(digest.hexdigest())
+    settings = {}
+    init_kwargs = getattr(tokenizer, "init_kwargs", {})
+    for name in (
+        "do_lower_case", "strip_accents", "tokenize_chinese_chars", "add_prefix_space",
+        "clean_up_tokenization_spaces", "legacy", "split_special_tokens",
+        "spaces_between_special_tokens", "add_bos_token", "add_eos_token",
+    ):
+        value = getattr(tokenizer, name, None)
+        if value is None and isinstance(init_kwargs, dict):
+            value = init_kwargs.get(name)
+        if value is not None:
+            settings[name] = value
+    settings["special_tokens_map"] = getattr(tokenizer, "special_tokens_map", {})
+    pieces.append(json.dumps(settings, sort_keys=True, default=str, separators=(",", ":")))
+    backend = getattr(tokenizer, "backend_tokenizer", None)
+    serialize_backend = getattr(backend, "to_str", None)
+    if callable(serialize_backend):
+        serialized = serialize_backend()
+        try:
+            backend_settings = json.loads(serialized)
+        except (TypeError, json.JSONDecodeError):
+            backend_settings = serialized
+        if isinstance(backend_settings, dict):
+            # These call-time limits are recorded by the scoring parameters;
+            # they can be mutated by ordinary encode calls on HF tokenizers.
+            backend_settings.pop("padding", None)
+            backend_settings.pop("truncation", None)
+        pieces.append(json.dumps(backend_settings, sort_keys=True, separators=(",", ":")))
+    bpe_ranks = getattr(tokenizer, "bpe_ranks", None)
+    if isinstance(bpe_ranks, dict):
+        pieces.append(json.dumps(
+            sorted((list(pair), int(rank)) for pair, rank in bpe_ranks.items()),
+            ensure_ascii=False, separators=(",", ":"),
+        ))
+    sentencepiece = getattr(tokenizer, "sp_model", None)
+    serialize_sentencepiece = getattr(sentencepiece, "serialized_model_proto", None)
+    if callable(serialize_sentencepiece):
+        pieces.append(stable_hash(serialize_sentencepiece(), length=64))
+    return stable_hash("\x00".join(pieces), length=32)
