@@ -273,3 +273,82 @@ def cohen_d(left: Sequence[float], right: Sequence[float]) -> float:
     if pooled == 0.0:
         return 0.0
     return (float(np.mean(left_array)) - float(np.mean(right_array))) / pooled
+
+
+def rankdata(values: Sequence[float]) -> np.ndarray:
+    """Average ranks, with ties receiving the mean of their positions."""
+    array = _as_float_array(values, name="values")
+    order = np.argsort(array, kind="mergesort")
+    ranks = np.empty(len(array), dtype=float)
+    sorted_values = array[order]
+    start = 0
+    while start < len(array):
+        end = start + 1
+        while end < len(array) and sorted_values[end] == sorted_values[start]:
+            end += 1
+        ranks[order[start:end]] = 0.5 * (start + end - 1) + 1.0
+        start = end
+    return ranks
+
+
+def mann_whitney_auc(positive: Sequence[float], negative: Sequence[float]) -> float:
+    """AUC = P(positive > negative) + 0.5 P(positive == negative)."""
+    positive_array = _as_float_array(positive, name="positive")
+    negative_array = _as_float_array(negative, name="negative")
+    if len(positive_array) == 0 or len(negative_array) == 0:
+        raise ValueError("AUC requires both positive and negative scores.")
+    combined = np.concatenate([positive_array, negative_array])
+    ranks = rankdata(combined)
+    positive_rank_sum = float(np.sum(ranks[: len(positive_array)]))
+    count_positive = len(positive_array)
+    count_negative = len(negative_array)
+    return (
+        positive_rank_sum - count_positive * (count_positive + 1) / 2.0
+    ) / (count_positive * count_negative)
+
+
+def auc_de_long_ci(
+    positive: Sequence[float],
+    negative: Sequence[float],
+    *,
+    confidence: float = 0.95,
+) -> dict[str, float]:
+    """AUC with a DeLong variance estimate and normal-approximation interval."""
+    positive_array = _as_float_array(positive, name="positive")
+    negative_array = _as_float_array(negative, name="negative")
+    if len(positive_array) < 2 or len(negative_array) < 2:
+        raise ValueError("DeLong intervals require at least two scores per group.")
+    if not 0.0 < confidence < 1.0:
+        raise ValueError("Confidence must be between 0 and 1.")
+
+    positive_count = len(positive_array)
+    negative_count = len(negative_array)
+    # Chunk to keep the pairwise comparison matrix bounded.
+    positive_placements = np.empty(positive_count, dtype=float)
+    negative_placements = np.empty(negative_count, dtype=float)
+    negative_placements_sum = np.zeros(negative_count, dtype=float)
+    chunk = max(1, 4_000_000 // max(1, negative_count))
+    for start in range(0, positive_count, chunk):
+        block = positive_array[start : start + chunk]
+        greater = block[:, None] > negative_array[None, :]
+        equal = block[:, None] == negative_array[None, :]
+        positive_placements[start : start + len(block)] = np.mean(
+            greater + 0.5 * equal, axis=1
+        )
+        negative_placements_sum += np.sum(greater + 0.5 * equal, axis=0)
+    negative_placements[:] = negative_placements_sum / positive_count
+    auc_value = float(np.mean(positive_placements))
+    variance = float(
+        np.var(positive_placements, ddof=1) / positive_count
+        + np.var(negative_placements, ddof=1) / negative_count
+    )
+    standard_error = math.sqrt(max(variance, 0.0))
+    critical = normal_ppf(0.5 + confidence / 2.0)
+    return {
+        "auc": auc_value,
+        "standard_error": standard_error,
+        "ci_low": clamp(auc_value - critical * standard_error),
+        "ci_high": clamp(auc_value + critical * standard_error),
+        "positive_count": float(positive_count),
+        "negative_count": float(negative_count),
+    }
