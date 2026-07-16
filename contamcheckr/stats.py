@@ -639,3 +639,115 @@ def bonferroni_combination(pvalues: Sequence[float]) -> float:
     """Bonferroni correction; valid under any dependence."""
     array = _validated_pvalues(pvalues)
     return float(clamp(float(np.min(array)) * len(array)))
+
+
+def bh_qvalues(pvalues: Sequence[float]) -> np.ndarray:
+    """Benjamini-Hochberg adjusted p-values (q-values)."""
+    array = _validated_pvalues(pvalues)
+    count = len(array)
+    order = np.argsort(array)
+    ordered = array[order]
+    adjusted = ordered * count / np.arange(1, count + 1)
+    adjusted = np.minimum.accumulate(adjusted[::-1])[::-1]
+    adjusted = np.clip(adjusted, 0.0, 1.0)
+    result = np.empty(count, dtype=float)
+    result[order] = adjusted
+    return result
+
+
+def storey_pi0(
+    pvalues: Sequence[float],
+    *,
+    lambda_value: float = 0.5,
+) -> float:
+    """Storey's estimate of the null proportion ``pi0``.
+
+    Under a mixture where a fraction ``pi0`` of hypotheses are null with
+    uniform p-values, ``P(p > lambda) = pi0 * (1 - lambda)``.  The estimate is
+    clipped to ``[0, 1]``.
+    """
+    array = _validated_pvalues(pvalues)
+    if not 0.0 < lambda_value < 1.0:
+        raise ValueError("Lambda must be between 0 and 1.")
+    proportion = float(np.mean(array > lambda_value))
+    estimate = proportion / (1.0 - lambda_value)
+    return float(clamp(estimate))
+
+
+def conformal_pvalues(
+    test_scores: Sequence[float],
+    null_scores: Sequence[float],
+    *,
+    higher_is_more_suspicious: bool = True,
+) -> np.ndarray:
+    """Distribution-free conformal p-values against a calibration sample.
+
+    ``p_i = (1 + #{null >= test_i}) / (n_null + 1)`` for the "greater"
+    direction.  Under exchangeability of the test and null scores this is
+    super-uniform.  Ties are counted against the test point, which is the
+    conservative choice.
+    """
+    test_array = _as_float_array(test_scores, name="test_scores")
+    null_array = _as_float_array(null_scores, name="null_scores")
+    if len(null_array) == 0:
+        raise ValueError("Conformal p-values require a null sample.")
+    if higher_is_more_suspicious:
+        sorted_null = np.sort(null_array)
+        # Number of null scores >= each test score.
+        counts = len(sorted_null) - np.searchsorted(
+            sorted_null, test_array, side="left"
+        )
+    else:
+        sorted_null = np.sort(null_array)
+        counts = np.searchsorted(sorted_null, test_array, side="right")
+    return (1.0 + counts) / (len(sorted_null) + 1.0)
+
+
+def benjamini_hochberg_flags(
+    pvalues: Sequence[float],
+    *,
+    alpha: float = 0.1,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return BH flags and q-values at the requested FDR level."""
+    if not 0.0 < alpha < 1.0:
+        raise ValueError("FDR level must be between 0 and 1.")
+    adjusted = bh_qvalues(pvalues)
+    return adjusted <= alpha, adjusted
+
+
+# ---------------------------------------------------------------------------
+# Bayes-factor calibration
+# ---------------------------------------------------------------------------
+
+
+def minimum_bayes_factor(pvalue: float) -> float:
+    """Sellke-Bayarri-Berger lower bound on the Bayes factor for H1.
+
+    For ``p >= 1/e`` the bound is 1 (no evidence).  For smaller p-values the
+    bound on the Bayes factor *in favor of the null* is ``-e * p * log(p)``;
+    this function returns its reciprocal, the lower bound in favor of the
+    alternative.  The bound is a heuristic calibration, not a substitute for a
+    specified alternative model.
+    """
+    if not 0.0 <= pvalue <= 1.0:
+        raise ValueError("P-value must lie in [0, 1].")
+    if pvalue <= 0.0:
+        return math.inf
+    if pvalue >= 1.0 / math.e:
+        return 1.0
+    return float(1.0 / (-math.e * pvalue * math.log(pvalue)))
+
+
+def posterior_probability(
+    bayes_factor: float,
+    *,
+    prior_probability: float = 0.5,
+) -> float:
+    """Posterior probability from a Bayes factor and a prior probability."""
+    if bayes_factor < 0.0:
+        raise ValueError("Bayes factor must be non-negative.")
+    if not 0.0 < prior_probability < 1.0:
+        raise ValueError("Prior probability must be between 0 and 1.")
+    prior_odds = prior_probability / (1.0 - prior_probability)
+    posterior_odds = prior_odds * bayes_factor
+    return float(posterior_odds / (1.0 + posterior_odds))
