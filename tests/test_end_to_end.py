@@ -84,9 +84,12 @@ def test_full_flow_is_reproducible_with_and_without_control() -> None:
         "caveats",
     }
     assert required <= without.keys()
-    assert 0.0 <= without["contamination_index"] <= 1.0
-    assert without["index_basis"] == "guided_plus_order"
-    assert with_control["index_basis"] == "combined"
+    assert without["contamination_index"] is None
+    assert without["band"] == "insufficient evidence"
+    assert without["index_basis"] == "none"
+    assert with_control["index_basis"] == "minkpp"
+    assert with_control["likelihood_baseline"]["loss_auc"] is not None
+    assert 0.0 <= with_control["contamination_index"] <= 1.0
     assert without["contamination_index"] == repeated["contamination_index"]
     assert without["confidence_interval"] == repeated["confidence_interval"]
     html = build_html(with_control)
@@ -144,7 +147,10 @@ def test_cached_huggingface_model_full_flow() -> None:
     first = build_report(model, benchmark, None, without_config)
     second = build_report(model, benchmark, None, without_config)
     controlled = build_report(model, benchmark, control, with_config)
-    assert first["index_basis"] == "guided_plus_order"
-    assert controlled["index_basis"] == "combined"
+    assert first["index_order"] is None
+    assert first["order_p_value"] is not None
+    assert "order" not in first["index_basis"]
+    assert controlled["index_minkpp"] is not None
+    assert controlled["likelihood_baseline"]["loss_auc"] is not None
     assert first["contamination_index"] == second["contamination_index"]
     assert first["confidence_interval"] == second["confidence_interval"]
