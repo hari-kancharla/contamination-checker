@@ -1,9 +1,13 @@
-from dataclasses import dataclass
+"""Min-K%++ scoring on top of the shared token-statistics pipeline."""
 
-import numpy as np
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any
+
 import torch
 
-from ..metrics import lowest_percent
+from .token_stats import TokenStats, score_token_stats, token_stats_from_logits
 
 
 @dataclass(frozen=True)
@@ -12,66 +16,88 @@ class MinKScores:
     minkpp: float
     token_count: int
     skipped_token_count: int
+    loss: float
+    truncated: bool = False
+    zlib: float = 0.0
+    entropy: float = 0.0
+    mean_rank: float = 0.0
+    top1_prob: float = 0.0
 
 
 def score_logits(
     logits: torch.Tensor,
-    target_ids: torch.Tensor,
+    targets: torch.Tensor,
     *,
     k: float = 20.0,
 ) -> MinKScores:
-    if logits.ndim != 2:
-        raise ValueError("Logits must have shape [tokens, vocabulary].")
-    if target_ids.ndim != 1 or len(target_ids) != len(logits):
-        raise ValueError("Target ids must contain one id per logits row.")
-    if len(target_ids) == 0:
-        raise ValueError("Min-K scoring requires at least one target token.")
-    log_probs = torch.log_softmax(logits.float(), dim=-1)
-    probs = torch.softmax(logits.float(), dim=-1)
-    raw_scores: list[float] = []
-    normalized_scores: list[float] = []
-    skipped = 0
-    for row_index, (row, target_id) in enumerate(
-        zip(log_probs, target_ids, strict=True)
-    ):
-        target = int(target_id.item())
-        if target < 0 or target >= row.shape[0]:
-            raise ValueError(f"Target token id {target} is outside the vocabulary.")
-        probability_row = probs[row_index]
-        target_logprob = float(row[target].item())
-        mu = torch.sum(probability_row * row)
-        variance = torch.sum(probability_row * (row - mu).square())
-        sigma = torch.sqrt(torch.clamp(variance, min=0.0))
-        mu_value = float(mu.item())
-        sigma_value = float(sigma.item())
-        if not np.isfinite(target_logprob) or not np.isfinite(mu_value):
-            skipped += 1
-            continue
-        raw_scores.append(target_logprob)
-        if sigma_value == 0.0 or not np.isfinite(sigma_value):
-            skipped += 1
-            continue
-        normalized = (target_logprob - mu_value) / sigma_value
-        if np.isfinite(normalized):
-            normalized_scores.append(normalized)
-        else:
-            skipped += 1
-    if not raw_scores or not normalized_scores:
-        raise ValueError("No tokens had a finite non-zero Min-K%++ variance.")
+    """Compatibility wrapper around the shared token-statistics pipeline."""
+    stats = token_stats_from_logits(logits, targets)
+    scores = score_token_stats(stats, "", k=k)
+    return _to_min_k_scores(scores, stats)
+
+
+def _to_min_k_scores(scores: Any, stats: TokenStats) -> MinKScores:
     return MinKScores(
-        mink=float(np.mean(lowest_percent(raw_scores, k))),
-        minkpp=float(np.mean(lowest_percent(normalized_scores, k))),
-        token_count=len(normalized_scores),
-        skipped_token_count=skipped,
+        mink=scores.mink,
+        minkpp=scores.minkpp,
+        token_count=scores.token_count,
+        skipped_token_count=scores.skipped_token_count,
+        loss=scores.loss,
+        truncated=stats.truncated,
+        zlib=scores.zlib,
+        entropy=scores.entropy,
+        mean_rank=scores.mean_rank,
+        top1_prob=scores.top1_prob,
     )
 
 
+def score_token_stats_text(
+    stats: TokenStats,
+    text: str,
+    *,
+    k: float = 20.0,
+) -> MinKScores:
+    """Turn cached/computed token statistics into Min-K scores for a text."""
+    scores = score_token_stats(stats, text, k=k)
+    return _to_min_k_scores(scores, stats)
+
+
 def score_text(
-    model: object,
+    model: Any,
     text: str,
     *,
     k: float = 20.0,
     max_tokens: int = 512,
 ) -> MinKScores:
-    logits, target_ids = model.token_logprob_table(text, max_tokens=max_tokens)
-    return score_logits(logits, target_ids, k=k)
+    token_stats = getattr(model, "token_stats", None)
+    if callable(token_stats):
+        stats = token_stats(text, max_tokens=max_tokens)
+        return score_token_stats_text(stats, text, k=k)
+    logits, targets = model.token_logprob_table(text, max_tokens=max_tokens)
+    stats = token_stats_from_logits(logits, targets)
+    return score_token_stats_text(stats, text, k=k)
+
+
+def score_text_batch(
+    model: Any,
+    texts: list[str],
+    *,
+    k: float = 20.0,
+    max_tokens: int = 512,
+    batch_size: int = 4,
+) -> list[MinKScores]:
+    """Score a list of texts, batching the forward pass when possible."""
+    if not texts:
+        return []
+    batch_stats = getattr(model, "token_stats_batch", None)
+    if callable(batch_stats):
+        stats_list = batch_stats(
+            texts, max_tokens=max_tokens, batch_size=batch_size
+        )
+        return [
+            score_token_stats_text(stats, text, k=k)
+            for stats, text in zip(stats_list, texts, strict=True)
+        ]
+    return [
+        score_text(model, text, k=k, max_tokens=max_tokens) for text in texts
+    ]
