@@ -162,3 +162,53 @@ class ScoreCache:
 
     def __exit__(self, *_: object) -> None:
         self.close()
+
+
+class NullCache:
+    """No-op cache with the same interface as :class:`ScoreCache`."""
+
+    path: Path | None = None
+
+    def get_token_stats(self, key: str) -> dict[str, Any] | None:
+        return None
+
+    def put_token_stats(self, key: str, payload: dict[str, Any]) -> None:
+        return None
+
+    def get_sequence_ll(self, key: str) -> float | None:
+        return None
+
+    def put_sequence_ll(self, key: str, value: float) -> None:
+        return None
+
+    def get_generation(self, key: str) -> str | None:
+        return None
+
+    def put_generation(self, key: str, value: str) -> None:
+        return None
+
+    def stats(self) -> dict[str, int]:
+        return {"token_stats": 0, "sequence_ll": 0, "generations": 0}
+
+    def clear(self) -> None:
+        return None
+
+    def close(self) -> None:
+        return None
+
+    def __enter__(self) -> "NullCache":
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        return None
+
+
+def open_cache(
+    *,
+    enabled: bool = True,
+    path: str | Path | None = None,
+) -> ScoreCache | NullCache:
+    """Open a cache, or a no-op cache when disabled."""
+    if not enabled:
+        return NullCache()
+    return ScoreCache(path)
