@@ -19,6 +19,13 @@ def test_index_bases_and_weights() -> None:
     assert combined.contamination_index == 0.5 * 0.4 + 0.3 * 0.6 + 0.2 * 0.8
 
 
+def test_no_eligible_method_is_insufficient_evidence() -> None:
+    empty = combine_indices(None, None, None)
+    assert empty.contamination_index is None
+    assert empty.index_basis == "none"
+    assert empty.band == "insufficient evidence"
+
+
 def test_minkpp_is_uncalibrated_without_control() -> None:
     index, measured_auc = calibrate_minkpp([0.1, 0.2], None)
     assert index is None
