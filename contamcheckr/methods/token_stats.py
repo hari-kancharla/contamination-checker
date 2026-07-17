@@ -90,3 +90,72 @@ class TokenScores:
             "skipped_token_count": self.skipped_token_count,
             "zlib_ratio": self.zlib_ratio,
         }
+
+
+def token_stats_from_logits(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    *,
+    token_chunk_size: int = 64,
+    truncated: bool = False,
+) -> TokenStats:
+    """Compute per-token statistics from ``[tokens, vocabulary]`` logits.
+
+    The vocabulary softmax is evaluated in token chunks so that a long sequence
+    does not require several full ``[tokens, vocabulary]`` copies in memory.
+    """
+    if logits.ndim != 2:
+        raise ValueError("Logits must have shape [tokens, vocabulary].")
+    if targets.ndim != 1 or len(targets) != len(logits):
+        raise ValueError("Target ids must contain one id per logits row.")
+    if len(targets) == 0:
+        raise ValueError("Token statistics require at least one target token.")
+    if token_chunk_size < 1:
+        raise ValueError("Token chunk size must be at least one.")
+
+    target_logprobs: list[float] = []
+    means: list[float] = []
+    stds: list[float] = []
+    entropies: list[float] = []
+    top1_probs: list[float] = []
+    ranks: list[int] = []
+
+    with torch.inference_mode():
+        for start in range(0, len(targets), token_chunk_size):
+            block_logits = logits[start : start + token_chunk_size].float()
+            block_targets = targets[start : start + token_chunk_size].to(
+                block_logits.device
+            )
+            log_probs = torch.log_softmax(block_logits, dim=-1)
+            probabilities = log_probs.exp()
+            target_logprob = log_probs.gather(
+                1, block_targets.unsqueeze(1)
+            ).squeeze(1)
+            mean = torch.sum(probabilities * log_probs, dim=-1)
+            variance = torch.sum(
+                probabilities * (log_probs - mean.unsqueeze(1)).square(),
+                dim=-1,
+            )
+            standard_deviation = torch.sqrt(torch.clamp(variance, min=0.0))
+            top1 = torch.max(probabilities, dim=-1).values
+            rank = torch.sum(
+                log_probs > target_logprob.unsqueeze(1), dim=-1
+            ) + 1
+
+            target_logprobs.extend(target_logprob.detach().cpu().tolist())
+            means.extend(mean.detach().cpu().tolist())
+            stds.extend(standard_deviation.detach().cpu().tolist())
+            entropies.extend((-mean).detach().cpu().tolist())
+            top1_probs.extend(top1.detach().cpu().tolist())
+            ranks.extend(int(value) for value in rank.detach().cpu().tolist())
+
+    return TokenStats(
+        target_logprobs=tuple(target_logprobs),
+        means=tuple(means),
+        stds=tuple(stds),
+        entropies=tuple(entropies),
+        top1_probs=tuple(top1_probs),
+        ranks=tuple(ranks),
+        token_count=len(target_logprobs),
+        truncated=truncated,
+    )
