@@ -231,3 +231,47 @@ def tokenizer_fingerprint(tokenizer: Any) -> str:
     if callable(serialize_sentencepiece):
         pieces.append(stable_hash(serialize_sentencepiece(), length=64))
     return stable_hash("\x00".join(pieces), length=32)
+
+
+def model_fingerprint(
+    *,
+    model_id: str,
+    revision: str | None,
+    dtype: str,
+    tokenizer: Any,
+    parameter_count: int | None = None,
+    transformers_version: str | None = None,
+    resolved_revision: str | None = None,
+    tokenizer_revision: str | None = None,
+) -> str:
+    """Best-effort cache identity using resolved revisions when available.
+
+    Local weights use metadata signatures, not cryptographic content hashes.
+    Missing resolved Hub revisions are retained as unknown, never inferred
+    from a mutable model name or branch.
+    """
+    payload = {
+        "fingerprint_schema": 2,
+        "model_id": model_id,
+        "revision": revision,
+        "resolved_revision": resolved_revision,
+        "tokenizer_revision": tokenizer_revision or resolved_commit_hash(tokenizer),
+        "dtype": dtype,
+        "tokenizer": tokenizer_fingerprint(tokenizer),
+        "parameter_count": parameter_count,
+        "transformers_version": transformers_version,
+        "local_signature": local_model_signature(model_id),
+        "cwd": os.getcwd() if Path(model_id).expanduser().is_dir() else None,
+    }
+    return stable_hash(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")),
+        length=32,
+    )
+
+
+def config_fingerprint(values: dict[str, Any]) -> str:
+    """Stable fingerprint of a configuration dictionary."""
+    return stable_hash(
+        json.dumps(values, sort_keys=True, default=str, separators=(",", ":")),
+        length=32,
+    )
