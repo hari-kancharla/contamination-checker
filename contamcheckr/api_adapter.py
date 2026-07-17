@@ -79,3 +79,126 @@ def _urllib_transport(
         # The status is sufficient to report the failure without exposing them.
         error.close()
         return error.code, None
+
+
+class RemoteCausalLM:
+    """Black-box generation adapter over an OpenAI-style completions API."""
+
+    def __init__(
+        self,
+        model_id: str,
+        *,
+        base_url: str,
+        api_key_env: str = "CONTAMCHECKR_API_KEY",
+        transport: Transport | None = None,
+        model_name: str | None = None,
+    ) -> None:
+        if not model_id.strip():
+            raise ValueError("Model identifier cannot be empty.")
+        if not base_url.strip():
+            raise ValueError("Base URL cannot be empty.")
+        self.model_id = model_id
+        self.base_url = base_url.strip().rstrip("/")
+        self.api_key_env = api_key_env
+        self._transport = transport or _urllib_transport
+        self._model_name = model_name or model_id
+        self.tokenizer = UnicodeCodepointTokenizer()
+        self.generation_metadata = {
+            "backend": "completion_api",
+            "endpoint_type": "completions",
+            "split_unit": "unicode_codepoint",
+            "output_truncation_unit": "unicode_codepoint",
+            "provider_tokenizer_known": False,
+            "provider_token_counts_known": False,
+            "request_budget": "suffix_codepoint_count_plus_16_heuristic",
+            "request_batching": "sequential_per_prompt",
+            "caveats": [
+                "Remote text is split and truncated in Unicode code points, "
+                "not provider tokens. The requested max_tokens is a heuristic "
+                "budget; actual provider token counts are unknown.",
+                "Only the completions endpoint is supported. Temperature zero "
+                "does not guarantee deterministic output from a remote provider.",
+            ],
+        }
+        self.capabilities = ModelCapabilities(
+            supports_generation=True,
+            supports_logprobs=False,
+            supports_full_distribution=False,
+        )
+
+    def _headers(self) -> dict[str, str]:
+        headers = {"Content-Type": "application/json"}
+        api_key = os.environ.get(self.api_key_env)
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        return headers
+
+    def generate(self, prompt: str, max_new_tokens: int) -> str:
+        return self.generate_batch([prompt], max_new_tokens, batch_size=1)[0]
+
+    def generate_batch(
+        self,
+        prompts: list[str] | tuple[str, ...],
+        max_new_tokens: int,
+        *,
+        batch_size: int = 4,
+    ) -> list[str]:
+        if max_new_tokens < 1:
+            raise ValueError("max_new_tokens must be at least one.")
+        outputs: list[str] = []
+        for index in range(0, len(prompts), max(1, batch_size)):
+            chunk = list(prompts[index : index + max(1, batch_size)])
+            for prompt in chunk:
+                outputs.append(self._complete(prompt, max_new_tokens))
+        return outputs
+
+    def _complete(self, prompt: str, max_new_tokens: int) -> str:
+        try:
+            status, payload = self._transport(
+                "POST",
+                f"{self.base_url}/completions",
+                self._headers(),
+                {
+                    "model": self._model_name,
+                    "prompt": prompt,
+                    "max_tokens": max_new_tokens,
+                    "temperature": 0.0,
+                    "n": 1,
+                },
+            )
+        except (OSError, ValueError):
+            raise RuntimeError("Completion API request failed.") from None
+        if not isinstance(status, int) or not 100 <= status <= 599:
+            raise RuntimeError("Completion API returned an invalid HTTP status.")
+        if status != 200:
+            try:
+                phrase = HTTPStatus(status).phrase
+            except ValueError:
+                phrase = "Unknown status"
+            raise RuntimeError(f"Completion API error (HTTP {status} {phrase}).")
+        choices = payload.get("choices") if isinstance(payload, dict) else None
+        if not isinstance(choices, list) or not choices:
+            raise RuntimeError("Unexpected completion API reply: missing text choice.")
+        choice = choices[0]
+        text = choice.get("text") if isinstance(choice, dict) else None
+        if not isinstance(text, str):
+            raise RuntimeError("Unexpected completion API reply: text must be a string.")
+        return text
+
+
+def load_remote_model(
+    model_id: str,
+    *,
+    base_url: str,
+    api_key_env: str = "CONTAMCHECKR_API_KEY",
+    model_name: str | None = None,
+    transport: Transport | None = None,
+) -> RemoteCausalLM:
+    """Construct the black-box adapter (mirrors load_model's contract)."""
+    return RemoteCausalLM(
+        model_id,
+        base_url=base_url,
+        api_key_env=api_key_env,
+        transport=transport,
+        model_name=model_name,
+    )
