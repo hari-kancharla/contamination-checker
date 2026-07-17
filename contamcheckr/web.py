@@ -11,7 +11,7 @@ from urllib.parse import parse_qs, urlparse
 
 from .benchmarks import load_benchmark
 from .config import RunConfig
-from .html_report import build_html, write_html
+from .html_report import build_html, evidence_context_html, write_html
 from .model import load_model, set_seed
 from .report import build_report, write_csv, write_json
 
@@ -219,7 +219,7 @@ def _result_html(report: dict[str, Any]) -> str:
         (
             "Canonical order",
             report["index_order"],
-            f"p-value {_format(report['order_p_value'])}",
+            f"One-sided t-test p-value {_format(report['order_p_value'])}",
         ),
     ]
     methods = "".join(
@@ -260,7 +260,8 @@ def _result_html(report: dict[str, Any]) -> str:
       <p class="reading">Evidence with uncertainty, not proof of training inclusion.</p>
     </div>
     <div class="score-block">
-      <strong>{report['contamination_index']:.3f}</strong>
+      <strong>{_format(report['contamination_index'])}</strong>
+      <span>Heuristic index</span>
       <span>{escape(report['band'].title())}</span>
     </div>
   </div>
@@ -275,6 +276,7 @@ def _result_html(report: dict[str, Any]) -> str:
     <a href="/report" target="_blank">Open standalone report</a>
   </div>
 </section>
+{evidence_context_html(report)}
 <section>
   <div class="section-heading">
     <div><p class="kicker">Access probe</p><h2>Model capabilities</h2></div>
