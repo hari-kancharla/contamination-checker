@@ -159,3 +159,73 @@ def token_stats_from_logits(
         token_count=len(target_logprobs),
         truncated=truncated,
     )
+
+
+def zlib_ratio(text: str) -> float:
+    """Compressed bytes per raw byte, clipped away from zero."""
+    raw = text.encode("utf-8")
+    if not raw:
+        return 1.0
+    return max(len(zlib.compress(raw, level=9)) / len(raw), 1.0e-9)
+
+
+def score_token_stats(
+    stats: TokenStats,
+    text: str,
+    *,
+    k: float = 20.0,
+) -> TokenScores:
+    """Turn per-token statistics into aggregate membership-style scores."""
+    if not 0.0 < k <= 100.0:
+        raise ValueError("k must be greater than 0 and at most 100.")
+    if stats.token_count == 0:
+        raise ValueError("Token statistics are empty.")
+
+    raw_scores: list[float] = []
+    normalized_scores: list[float] = []
+    entropies: list[float] = []
+    top1_probs: list[float] = []
+    ranks: list[float] = []
+    skipped = 0
+    for index in range(stats.token_count):
+        target_logprob = stats.target_logprobs[index]
+        mean = stats.means[index]
+        sigma = stats.stds[index]
+        entropy = stats.entropies[index]
+        top1 = stats.top1_probs[index]
+        rank = stats.ranks[index]
+        if not math.isfinite(target_logprob) or not math.isfinite(mean):
+            skipped += 1
+            continue
+        raw_scores.append(target_logprob)
+        entropies.append(entropy)
+        top1_probs.append(top1)
+        ranks.append(float(rank))
+        if sigma == 0.0 or not math.isfinite(sigma):
+            skipped += 1
+            continue
+        normalized = (target_logprob - mean) / sigma
+        if math.isfinite(normalized):
+            normalized_scores.append(normalized)
+        else:
+            skipped += 1
+
+    if not raw_scores:
+        raise ValueError("No tokens had a finite log-probability.")
+    if not normalized_scores:
+        raise ValueError("No tokens had a finite non-zero Min-K%++ variance.")
+
+    compression = zlib_ratio(text)
+    mean_logprob = float(np.mean(raw_scores))
+    return TokenScores(
+        mink=float(np.mean(lowest_percent(raw_scores, k))),
+        minkpp=float(np.mean(lowest_percent(normalized_scores, k))),
+        loss=mean_logprob,
+        zlib=mean_logprob + math.log(compression),
+        entropy=float(np.mean(entropies)),
+        top1_prob=float(np.mean(top1_probs)),
+        mean_rank=float(np.mean(ranks)),
+        token_count=len(normalized_scores),
+        skipped_token_count=skipped,
+        zlib_ratio=compression,
+    )
