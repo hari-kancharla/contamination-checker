@@ -161,3 +161,106 @@ def assign_exposure(records: list[dict[str, str]], settings: Settings) -> list[d
         }
         for row in records
     ]
+
+
+def _source_payloads() -> dict[str, bytes]:
+    paths = list((PROJECT / "contamcheckr").rglob("*.py"))
+    paths += list((PROJECT / "experiments").glob("*.py"))
+    paths += [PROJECT / "pyproject.toml"]
+    return {str(path.relative_to(PROJECT)): path.read_bytes() for path in sorted(paths)}
+
+
+def _source_manifest() -> dict[str, str]:
+    return {name: _sha(payload) for name, payload in _source_payloads().items()}
+
+
+def _model_manifest(path: Path) -> dict[str, Any]:
+    if not path.is_dir() or not (path / "config.json").is_file():
+        raise ValueError("--model must be an existing local checkpoint directory with config.json.")
+    files = {
+        str(item.relative_to(path)): {"sha256": _file_sha(item), "bytes": item.stat().st_size}
+        for item in sorted(path.rglob("*")) if item.is_file()
+    }
+    if not any(name.endswith((".bin", ".safetensors")) for name in files):
+        raise ValueError("Local checkpoint contains no .bin or .safetensors weights.")
+    return {"path": str(path.resolve()), "files": files, "content_sha256": _sha(_bytes(files))}
+
+
+def create_plan(input_path: Path, output_dir: Path, model_path: Path, settings: Settings) -> Path:
+    """Seal a new plan before model loading. Never overwrite an existing run."""
+    input_path, output_dir, model_path = (path.expanduser().resolve() for path in (input_path, output_dir, model_path))
+    if output_dir.exists():
+        raise FileExistsError(f"Run directory already exists: {output_dir}")
+    if output_dir == model_path or model_path in output_dir.parents:
+        raise ValueError("Run output must be outside the parent checkpoint directory.")
+    input_payload = input_path.read_bytes()
+    records = _read_pool_payload(input_payload, group_field=settings.group_field)
+    assignment = assign_exposure(records, settings)
+    model_manifest = _model_manifest(model_path)
+    source_payloads = _source_payloads()
+    sources = {name: _sha(payload) for name, payload in source_payloads.items()}
+    output_dir.mkdir(parents=True, exist_ok=False)
+    for name, payload in source_payloads.items():
+        destination = output_dir / "source_snapshot" / name
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with destination.open("xb") as handle:
+            handle.write(payload)
+    _write_rows(output_dir / "pool.jsonl", records)
+    _write_rows(output_dir / "assignment.jsonl", assignment)
+    _write_json(output_dir / "settings.json", asdict(settings))
+    _write_json(output_dir / "parent_checkpoint.json", model_manifest)
+    _write_json(output_dir / "source_manifest.json", sources)
+    frozen_files = ("pool.jsonl", "assignment.jsonl", "settings.json", "parent_checkpoint.json", "source_manifest.json")
+    plan = {
+        "schema": SCHEMA, "estimand": ESTIMAND,
+        "created_at_utc": datetime.now(timezone.utc).isoformat(),
+        "input_path": str(input_path), "input_file_sha256": _sha(input_payload),
+        "assignment_unit": "group" if settings.group_field else "item",
+        "assignment_mechanism": "Seeded simple random sample of groups without replacement, independent of item content.",
+        "n_items": len(records), "n_exposed": sum(row["exposed"] for row in assignment),
+        "n_groups": len({row["group_id"] for row in assignment}),
+        "frozen_files_sha256": {name: _file_sha(output_dir / name) for name in frozen_files},
+        "source_content_sha256": _sha(_bytes(sources)),
+        "source_snapshot_directory": "source_snapshot",
+        "parent_content_sha256": model_manifest["content_sha256"],
+        "primary_comparison": "Adapted Min-K%++ AUC minus adapted mean-log-probability AUC; paired group bootstrap.",
+        "secondary_comparisons": "All parent/adapted/change scores for loss, Min-K, Min-K%++; no post-hoc direction reversal or winner selection.",
+        "tokenization_policy": (
+            "Capture the tokenizer calls actually made by the scorer. Require unique "
+            "effective inputs, zero skipped targets, and parity with the trainer's "
+            "encode(add_special_tokens=False) text prefix. EOS appended by training "
+            "is the sole allowed training/scoring suffix difference."
+        ),
+    }
+    _write_json(output_dir / "plan.json", plan)
+    _write_json(output_dir / "plan_seal.json", {"plan_sha256": _file_sha(output_dir / "plan.json")})
+    return output_dir
+
+
+def _verify_plan(run_dir: Path) -> tuple[dict[str, Any], Settings, list[dict[str, str]], list[dict[str, Any]], str]:
+    plan_sha = _file_sha(run_dir / "plan.json")
+    if json.loads((run_dir / "plan_seal.json").read_text())["plan_sha256"] != plan_sha:
+        raise ValueError("Sealed plan was modified.")
+    plan = json.loads((run_dir / "plan.json").read_text())
+    if plan.get("schema") != SCHEMA:
+        raise ValueError("Unsupported plan schema.")
+    for name, expected in plan["frozen_files_sha256"].items():
+        if _file_sha(run_dir / name) != expected:
+            raise ValueError(f"Sealed file was modified: {name}")
+    sources = json.loads((run_dir / "source_manifest.json").read_text())
+    for name, expected in sources.items():
+        snapshot = run_dir / "source_snapshot" / name
+        if not snapshot.is_file() or _file_sha(snapshot) != expected:
+            raise ValueError(f"Sealed source snapshot was modified: {name}")
+    if _source_manifest() != sources:
+        raise ValueError("Source changed after plan creation; create a new run.")
+    checkpoint = json.loads((run_dir / "parent_checkpoint.json").read_text())
+    if _model_manifest(Path(checkpoint["path"])) != checkpoint:
+        raise ValueError("Parent checkpoint changed after plan creation.")
+    settings = Settings(**json.loads((run_dir / "settings.json").read_text()))
+    settings.validate()
+    records = _read_rows(run_dir / "pool.jsonl")
+    assignment = _read_rows(run_dir / "assignment.jsonl")
+    if assign_exposure(records, settings) != assignment:
+        raise ValueError("Assignment is inconsistent with the sealed pool/settings.")
+    return plan, settings, records, assignment, plan_sha
