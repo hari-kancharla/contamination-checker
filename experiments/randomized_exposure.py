@@ -474,3 +474,109 @@ def _state(run_dir: Path, **values: Any) -> None:
     temporary = run_dir / "execution.tmp"
     _write_json(temporary, values)
     temporary.replace(run_dir / "execution.json")
+
+
+def execute_plan(run_dir: Path, *, runtime: Runtime | None = None) -> dict[str, Any]:
+    """Execute a sealed, never-started plan. Failed runs cannot be overwritten."""
+    run_dir = run_dir.resolve()
+    plan, settings, records, assignment, plan_sha = _verify_plan(run_dir)
+    if (run_dir / "execution.json").exists() or (run_dir / "adapted_model").exists():
+        raise FileExistsError("Plan was already started; create a new run directory.")
+    _state(run_dir, status="running", plan_sha256=plan_sha, started_at_utc=datetime.now(timezone.utc).isoformat())
+    try:
+        runtime = runtime or _get_runtime()
+        checkpoint = json.loads((run_dir / "parent_checkpoint.json").read_text())
+        parent, parent_identity = _score_checkpoint(runtime, checkpoint["path"], records, settings)
+        _write_rows(run_dir / "parent_scores.jsonl", parent)
+        _validate_score_support(parent, stage="Parent")
+        _reject_effective_duplicates(parent)
+        exposed_ids = {row["id"] for row in assignment if row["exposed"]}
+        training_items = [{"id": row["id"], "text": row["text"]} for row in records if row["id"] in exposed_ids]
+        training_metadata = runtime.train(
+            checkpoint["path"], run_dir / "adapted_model", training_items,
+            device_name=settings.device, seed=settings.training_seed, epochs=settings.epochs,
+            learning_rate=settings.learning_rate, batch_size=settings.training_batch_size,
+            max_length=settings.max_tokens, include_order_canaries=False,
+        )
+        _write_json(run_dir / "training_metadata.json", training_metadata)
+        adapted, adapted_identity = _score_checkpoint(runtime, str(run_dir / "adapted_model"), records, settings)
+        _write_rows(run_dir / "adapted_scores.jsonl", adapted)
+        _validate_score_support(adapted, stage="Adapted")
+        rows = []
+        for assigned, before, after in zip(assignment, parent, adapted, strict=True):
+            if assigned["id"] != before["id"] or before["id"] != after["id"] or before["token_ids_sha256"] != after["token_ids_sha256"]:
+                raise ValueError("Parent/adapted score alignment or tokenization changed.")
+            rows.append({**assigned, "parent": before, "adapted": after, "delta": {key: after[key] - before[key] for key in SCORES}})
+        _write_rows(run_dir / "per_item.jsonl", rows)
+        summary = summarize(rows, settings)
+        if _source_manifest() != json.loads((run_dir / "source_manifest.json").read_text()):
+            raise ValueError("Source changed during execution; results are incomplete.")
+        if _model_manifest(Path(checkpoint["path"])) != checkpoint:
+            raise ValueError("Parent checkpoint changed during execution; results are incomplete.")
+        summary.update({
+            "schema": SCHEMA, "plan_sha256": plan_sha,
+            "parent_identity": parent_identity, "adapted_identity": adapted_identity,
+            "adapted_checkpoint": _model_manifest(run_dir / "adapted_model"),
+            "input_file_sha256": plan["input_file_sha256"], "source_content_sha256": plan["source_content_sha256"],
+            "parent_content_sha256": plan["parent_content_sha256"],
+            "environment": {
+                "python": sys.version, "platform": platform.platform(),
+                "packages": {name: importlib.metadata.version(name) for name in ("torch", "transformers", "numpy", "datasets")},
+            },
+        })
+        _write_json(run_dir / "summary.json", summary)
+        _state(run_dir, status="complete", plan_sha256=plan_sha, finished_at_utc=datetime.now(timezone.utc).isoformat(), summary_sha256=_file_sha(run_dir / "summary.json"))
+        return summary
+    except (Exception, KeyboardInterrupt) as error:
+        _state(run_dir, status="failed", plan_sha256=plan_sha, error_type=type(error).__name__, error=str(error))
+        raise
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
+    parser.add_argument("action", choices=("plan", "run"))
+    parser.add_argument("--from-plan", type=Path, help="For run: execute a sealed, never-started plan without overriding settings.")
+    parser.add_argument("--input", type=Path, help="One local JSONL pool, with string id/text and optional group field.")
+    parser.add_argument("--output", type=Path, help="A new run directory; existing paths are rejected.")
+    parser.add_argument("--model", type=Path, help="Existing local parent checkpoint; downloads are disabled.")
+    parser.add_argument("--assignment-seed", type=int, default=17)
+    parser.add_argument("--training-seed", type=int, default=17)
+    parser.add_argument("--bootstrap-seed", type=int, default=101)
+    parser.add_argument("--exposed-fraction", type=float, default=.5)
+    parser.add_argument("--group-field")
+    parser.add_argument("--epochs", type=int, default=1)
+    parser.add_argument("--learning-rate", type=float, default=.00005)
+    parser.add_argument("--training-batch-size", type=int, default=2)
+    parser.add_argument("--scoring-batch-size", type=int, default=2)
+    parser.add_argument("--max-tokens", type=int, default=256)
+    parser.add_argument("--k", type=float, default=20.)
+    parser.add_argument("--bootstrap-draws", type=int, default=2000)
+    parser.add_argument("--device", choices=("cpu", "mps", "cuda", "auto"), default="cpu")
+    argument_list = sys.argv[1:] if argv is None else argv
+    args = parser.parse_args(argument_list)
+    try:
+        if args.from_plan is not None:
+            setting_flags = {"--" + name.replace("_", "-") for name in Settings.__dataclass_fields__}
+            overrides = any(value.split("=", 1)[0] in setting_flags for value in argument_list)
+            if args.action != "run" or any(value is not None for value in (args.input, args.output, args.model)) or overrides:
+                raise ValueError("Use run --from-plan alone; sealed inputs/settings cannot be overridden.")
+            run_dir = args.from_plan.expanduser().resolve()
+        else:
+            if any(value is None for value in (args.input, args.output, args.model)):
+                raise ValueError("--input, --output and --model are required when creating a plan/run.")
+            settings = Settings(**{name: getattr(args, name) for name in Settings.__dataclass_fields__})
+            run_dir = create_plan(args.input, args.output, args.model, settings)
+        print(f"Sealed plan: {run_dir / 'plan.json'}", flush=True)
+        if args.action == "run":
+            summary = execute_plan(run_dir)
+            for key in ("adapted/loss", "adapted/mink", "adapted/minkpp", "delta/loss"):
+                print(f"{key} AUC: {summary['metrics'][key]['auc']:.6f}", flush=True)
+            print(f"Saved vectors and summary: {run_dir}", flush=True)
+        print(ESTIMAND, flush=True)
+        return 0
+    except (OSError, ValueError) as error:
+        parser.exit(2, f"error: {error}\n")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
