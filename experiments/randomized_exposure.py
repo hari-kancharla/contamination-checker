@@ -264,3 +264,213 @@ def _verify_plan(run_dir: Path) -> tuple[dict[str, Any], Settings, list[dict[str
     if assign_exposure(records, settings) != assignment:
         raise ValueError("Assignment is inconsistent with the sealed pool/settings.")
     return plan, settings, records, assignment, plan_sha
+
+
+def auc(positive: list[float], negative: list[float]) -> float:
+    """Tie-aware AUC; all scores are oriented higher = more exposure-like."""
+    if not positive or not negative or not all(math.isfinite(value) for value in positive + negative):
+        raise ValueError("AUC needs nonempty finite scores in both arms.")
+    ordered = sorted(negative)
+    wins = sum(bisect_left(ordered, value) + 0.5 * (bisect_right(ordered, value) - bisect_left(ordered, value)) for value in positive)
+    return wins / (len(positive) * len(negative))
+
+
+def _quantile(values: list[float], probability: float) -> float:
+    ordered = sorted(values)
+    location = probability * (len(ordered) - 1)
+    lower = int(location)
+    upper = min(lower + 1, len(ordered) - 1)
+    return ordered[lower] + (location - lower) * (ordered[upper] - ordered[lower])
+
+
+def summarize(rows: list[dict[str, Any]], settings: Settings) -> dict[str, Any]:
+    """Paired group bootstrap conditional on this pool and fitted checkpoints."""
+    groups: dict[bool, dict[str, list[int]]] = {True: {}, False: {}}
+    vectors = {f"{stage}/{score}": [row[stage][score] for row in rows] for stage in ("parent", "adapted", "delta") for score in SCORES}
+    for index, row in enumerate(rows):
+        groups[row["exposed"]].setdefault(row["group_id"], []).append(index)
+    if set(groups[True]) & set(groups[False]):
+        raise ValueError("A group cannot cross exposure arms.")
+    if min(map(len, groups.values())) < 2:
+        raise ValueError("Bootstrap requires at least two groups per arm.")
+    arm_indices = {arm: [index for values in by_group.values() for index in values] for arm, by_group in groups.items()}
+
+    def score_auc(values: list[float], indices: dict[bool, list[int]]) -> float:
+        return auc([values[i] for i in indices[True]], [values[i] for i in indices[False]])
+
+    points = {key: score_auc(values, arm_indices) for key, values in vectors.items()}
+    draws: dict[str, list[float]] = {key: [] for key in vectors}
+    differences: dict[str, list[float]] = {key: [] for key in vectors}
+    rng = random.Random(settings.bootstrap_seed)
+    for _ in range(settings.bootstrap_draws):
+        indices: dict[bool, list[int]] = {}
+        for arm, by_group in groups.items():
+            keys = sorted(by_group)
+            sampled = rng.choices(keys, k=len(keys))
+            indices[arm] = [index for group in sampled for index in by_group[group]]
+        replicate = {key: score_auc(values, indices) for key, values in vectors.items()}
+        for key, value in replicate.items():
+            draws[key].append(value)
+            differences[key].append(value - replicate[key.split("/")[0] + "/loss"])
+    metrics = {}
+    for key, value in points.items():
+        baseline = key.split("/")[0] + "/loss"
+        metrics[key] = {
+            "auc": value,
+            "auc_ci_percentile_95": [_quantile(draws[key], .025), _quantile(draws[key], .975)],
+            "auc_bootstrap_degenerate": min(draws[key]) == max(draws[key]),
+            "comparison_baseline": baseline,
+            "auc_difference_vs_loss": value - points[baseline],
+            "difference_ci_percentile_95": [_quantile(differences[key], .025), _quantile(differences[key], .975)],
+        }
+    return {
+        "estimand": ESTIMAND, "metrics": metrics,
+        "uncertainty": {
+            "method": "Paired percentile bootstrap, resampling groups separately within assigned arms.",
+            "draws": settings.bootstrap_draws, "seed": settings.bootstrap_seed,
+            "scope": "Conditional on this pool and fitted checkpoints; excludes training-seed and corpus variability. Saturated/degenerate intervals do not establish perfect population performance.",
+        },
+        "n_items": len(rows), "n_exposed": sum(row["exposed"] for row in rows),
+        "n_exposed_groups": len(groups[True]), "n_held_out_groups": len(groups[False]),
+        "score_orientation": "loss is mean token log-probability (higher is more likely); delta = adapted minus parent for each score.",
+        "caveats": [
+            "Held out means absent from this additional fine-tune, not proven absent from the parent training corpus.",
+            "Random assignment removes systematic content-label construction; it does not make this corpus representative of deployment.",
+            "Exact and whitespace-duplicate text is rejected; unlabelled near-duplicate/template families may still cross arms.",
+            "Task performance and benchmark inflation are not measured. No contamination verdict, combined p-value, FDR claim, or calibrated false-positive rate is produced.",
+            "Fine-tuning appends EOS; scoring uses the existing scorer without EOS. Truncation is recorded per item.",
+            "The runner rejects scorer default-special-token changes relative to the trainer's raw text prefix, duplicate effective scored inputs, and any skipped target tokens.",
+        ],
+    }
+
+
+def _get_runtime() -> Runtime:
+    # Set before importing transformers through validation/model.
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    os.environ["TRANSFORMERS_OFFLINE"] = "1"
+    os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
+    if str(PROJECT) not in sys.path:
+        sys.path.insert(0, str(PROJECT))
+    from contamcheckr.model import load_model
+    from contamcheckr.methods.minkpp import score_text_batch
+    from experiments.validation import fine_tune, move_model_to_cpu
+    return Runtime(load_model, fine_tune, score_text_batch, move_model_to_cpu)
+
+
+class _ScoringTokenizerTrace:
+    """Record inputs from the tokenizer calls actually used by the scorer.
+
+    Re-encoding with encode(False) is not an identity trace: HF defaults can
+    insert special tokens. This wrapper observes the returned input IDs and
+    attention mask from the scorer's real batch calls instead.
+    """
+
+    def __init__(self, tokenizer: Any, max_tokens: int):
+        self.original = tokenizer
+        self.max_tokens = max_tokens
+        self.inputs: dict[str, dict[str, Any]] = {}
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.original, name)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name in {"original", "max_tokens", "inputs"}:
+            object.__setattr__(self, name, value)
+        else:
+            setattr(self.original, name, value)
+
+    def __call__(self, texts: Any, *args: Any, **kwargs: Any) -> Any:
+        encoded = self.original(texts, *args, **kwargs)
+        submitted = [texts] if isinstance(texts, str) else list(texts)
+        input_rows = encoded["input_ids"]
+        input_rows = input_rows.tolist() if hasattr(input_rows, "tolist") else input_rows
+        masks = encoded.get("attention_mask")
+        masks = masks.tolist() if hasattr(masks, "tolist") else masks
+        if submitted and input_rows and isinstance(input_rows[0], int):
+            input_rows = [input_rows]
+            masks = [masks] if masks is not None else None
+        if len(input_rows) != len(submitted):
+            raise ValueError("Cannot align actual scorer tokenizer inputs.")
+        if kwargs.get("max_length") != self.max_tokens or not kwargs.get("truncation"):
+            raise ValueError("Scorer tokenizer did not use the frozen token budget.")
+        for index, text in enumerate(submitted):
+            if text in self.inputs:
+                raise ValueError("Scorer tokenized the same pool text more than once.")
+            tokens = [int(value) for value in input_rows[index]]
+            mask = [int(value) for value in masks[index]] if masks is not None else [1] * len(tokens)
+            length = sum(mask)
+            if len(mask) != len(tokens) or mask != [1] * length + [0] * (len(tokens) - length):
+                raise ValueError("Runner requires contiguous right-padded scorer inputs.")
+            # LocalCausalLM scores the first length tokens and their causal
+            # targets input_ids[1:length]; padding is not a scored input.
+            self.inputs[text] = {
+                "token_ids": tokens[:length],
+                "tokenizer_default_special_tokens": kwargs.get("add_special_tokens", True),
+            }
+        return encoded
+
+
+def _validate_score_support(rows: list[dict[str, Any]], *, stage: str) -> None:
+    for row in rows:
+        if row["skipped_token_count"] != 0 or row["token_count"] != row["expected_target_count"]:
+            raise ValueError(f"{stage} score support mismatch or skipped target tokens for {row['id']}.")
+        if not row["training_text_prefix_matches"]:
+            raise ValueError(f"{stage} scorer default special tokens/truncation differ from training text prefix for {row['id']}.")
+
+
+def _reject_effective_duplicates(rows: list[dict[str, Any]]) -> None:
+    seen: dict[str, str] = {}
+    for row in rows:
+        key = row["token_ids_sha256"]
+        if key in seen:
+            raise ValueError(
+                f"Duplicate effective scored input: {seen[key]} and {row['id']}; "
+                "distinct full texts can share the same retained token prefix."
+            )
+        seen[key] = row["id"]
+
+
+def _score_checkpoint(runtime: Runtime, path: str, records: list[dict[str, str]], settings: Settings) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    model = runtime.load(path, device=settings.device, dtype="float32", seed=settings.training_seed, local_files_only=True)
+    original_tokenizer = model.tokenizer
+    trace = _ScoringTokenizerTrace(original_tokenizer, settings.max_tokens)
+    model.tokenizer = trace
+    try:
+        scores = runtime.score(model, [row["text"] for row in records], k=settings.k, max_tokens=settings.max_tokens, batch_size=settings.scoring_batch_size)
+        if len(scores) != len(records):
+            raise ValueError("Scorer returned a different number of rows.")
+        rows = []
+        for record, score in zip(records, scores, strict=True):
+            values = {key: float(getattr(score, key)) for key in SCORES}
+            if not all(math.isfinite(value) for value in values.values()) or int(score.token_count) < 1:
+                raise ValueError(f"Nonfinite or empty scores for {record['id']}.")
+            captured = trace.inputs.get(record["text"])
+            if captured is None:
+                raise ValueError(f"Scorer did not expose an actual tokenizer call for {record['id']}.")
+            token_ids = captured["token_ids"]
+            if len(token_ids) < 2:
+                raise ValueError(f"Scorer input has fewer than two tokens for {record['id']}.")
+            training_prefix = original_tokenizer.encode(record["text"], add_special_tokens=False)[:settings.max_tokens]
+            rows.append({
+                "id": record["id"], **values,
+                "token_count": int(score.token_count), "skipped_token_count": int(score.skipped_token_count),
+                "truncated": bool(score.truncated), "token_ids_sha256": _sha(_bytes(token_ids)),
+                "token_ids": token_ids, "expected_target_count": len(token_ids) - 1,
+                "training_text_prefix_matches": list(training_prefix) == token_ids,
+                "tokenizer_default_special_tokens": captured["tokenizer_default_special_tokens"],
+                "token_identity_source": "Captured actual scorer tokenizer output and attention mask; causal targets are token_ids[1:].",
+            })
+        identity = {name: str(getattr(model, name, "unknown")) for name in ("model_id", "fingerprint", "tokenizer_fingerprint", "dtype", "device")}
+        identity.update({name: getattr(model, name, None) for name in ("revision", "parameter_count", "context_limit")})
+        return rows, identity
+    finally:
+        model.tokenizer = original_tokenizer
+        runtime.release(model)
+        del model
+        gc.collect()
+
+
+def _state(run_dir: Path, **values: Any) -> None:
+    temporary = run_dir / "execution.tmp"
+    _write_json(temporary, values)
+    temporary.replace(run_dir / "execution.json")
