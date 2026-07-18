@@ -97,6 +97,7 @@ def training_records(
     examples: list[dict[str, str]],
     *,
     max_length: int,
+    include_order_canaries: bool,
 ) -> list[tuple[list[int], list[int]]]:
     records = [
         encoded_record(
@@ -107,6 +108,10 @@ def training_records(
         )
         for example in examples
     ]
+    if not include_order_canaries:
+        return records
+    # Optional canaries. The order test scores these same concatenations, so
+    # they are a separate condition, not part of the membership run.
     for start in range(0, len(examples), 8):
         shard = SEPARATOR.join(
             example["text"] for example in examples[start : start + 8]
@@ -154,6 +159,7 @@ def fine_tune(
     learning_rate: float,
     batch_size: int,
     max_length: int,
+    include_order_canaries: bool,
 ) -> dict[str, float | int | str]:
     set_seed(seed)
     device = resolve_device(device_name)
@@ -166,7 +172,12 @@ def fine_tune(
     model.to(device)
     model.train()
     model.config.use_cache = False
-    records = training_records(tokenizer, examples, max_length=max_length)
+    records = training_records(
+        tokenizer,
+        examples,
+        max_length=max_length,
+        include_order_canaries=include_order_canaries,
+    )
     optimizer = AdamW(model.parameters(), lr=learning_rate)
     randomizer = random.Random(seed)
     losses: list[float] = []
@@ -219,6 +230,7 @@ def fine_tune(
         "learning_rate": learning_rate,
         "batch_size": batch_size,
         "record_count": len(records),
+        "include_order_canaries": include_order_canaries,
         "initial_loss": losses[0],
         "final_loss": losses[-1],
         "mean_last_ten_losses": float(np.mean(losses[-10:])),
@@ -287,8 +299,11 @@ def evaluate_candidate(
     learning_rate: float,
     batch_size: int,
     max_length: int,
+    include_order_canaries: bool,
 ) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
     safe_name = model_id.replace("/", "--")
+    if not include_order_canaries:
+        safe_name += "--members-only"
     adapted_path = MODELS_DIR / safe_name
     training = fine_tune(
         model_id,
@@ -300,6 +315,7 @@ def evaluate_candidate(
         learning_rate=learning_rate,
         batch_size=batch_size,
         max_length=max_length,
+        include_order_canaries=include_order_canaries,
     )
 
     adapted = load_model(str(adapted_path), device=device, seed=seed)
@@ -314,7 +330,7 @@ def evaluate_candidate(
     contaminated_on_clean = run_report(
         adapted,
         clean,
-        clean,
+        leak,
         model_id=str(adapted_path),
         device=device,
         seed=seed,
@@ -342,13 +358,21 @@ def evaluate_candidate(
         "base_on_leak": base_on_leak,
     }
     positive = contaminated_on_leak["contamination_index"]
-    strongest_negative = max(
+    negative_values = [
         contaminated_on_clean["contamination_index"],
         base_on_leak["contamination_index"],
-    )
+    ]
+    numeric_negatives = [
+        value for value in negative_values if isinstance(value, (int, float))
+    ]
+    strongest_negative = max(numeric_negatives) if numeric_negatives else None
     minimum_positive_index = 0.4
     minimum_control_separation = 0.2
-    separation = positive - strongest_negative
+    separation = (
+        positive - strongest_negative
+        if isinstance(positive, (int, float)) and strongest_negative is not None
+        else None
+    )
     metadata = {
         "training": training,
         "adapted_model": str(adapted_path),
@@ -360,7 +384,9 @@ def evaluate_candidate(
             "minimum_control_separation": minimum_control_separation,
         },
         "clear_separation": (
-            positive >= minimum_positive_index
+            isinstance(positive, (int, float))
+            and separation is not None
+            and positive >= minimum_positive_index
             and separation >= minimum_control_separation
         ),
     }
@@ -370,7 +396,7 @@ def evaluate_candidate(
 def comparison_rows(reports: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
     labels = {
         "contaminated_on_leak": "adapted model on leak set",
-        "contaminated_on_clean": "adapted model on clean set",
+        "contaminated_on_clean": "adapted model on clean set, scored against the leak set",
         "base_on_leak": "base model on leak set",
     }
     rows: list[dict[str, Any]] = []
@@ -387,6 +413,7 @@ def comparison_rows(reports: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
                 "minkpp_auc": report["minkpp_auc"],
                 "index_order": report["index_order"],
                 "order_p_value": report["order_p_value"],
+                "loss_auc": (report.get("likelihood_baseline") or {}).get("loss_auc"),
             }
         )
     return rows
@@ -395,12 +422,13 @@ def comparison_rows(reports: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
 def write_results(
     reports: dict[str, dict[str, Any]],
     metadata: dict[str, Any],
+    results_dir: Path,
 ) -> None:
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    results_dir.mkdir(parents=True, exist_ok=True)
     for name, report in reports.items():
-        write_json(report, RESULTS_DIR / f"{name}.json")
+        write_json(report, results_dir / f"{name}.json")
     rows = comparison_rows(reports)
-    with (RESULTS_DIR / "comparison.csv").open(
+    with (results_dir / "comparison.csv").open(
         "w",
         encoding="utf-8",
         newline="",
@@ -408,25 +436,32 @@ def write_results(
         writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
         writer.writeheader()
         writer.writerows(rows)
-    (RESULTS_DIR / "metadata.json").write_text(
+    (results_dir / "metadata.json").write_text(
         json.dumps(metadata, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
 
 
+def _fmt(value: object, width: int) -> str:
+    if value is None:
+        return f"{'n/a':>{width}}"
+    return f"{float(value):>{width}.3f}"
+
+
 def print_comparison(reports: dict[str, dict[str, Any]]) -> None:
     print(
         "run                         index   band               "
-        "guided  minkpp  order"
+        "guided  minkpp  order   loss_auc"
     )
     for row in comparison_rows(reports):
         print(
             f"{row['run']:<28} "
-            f"{row['contamination_index']:>5.3f}   "
-            f"{row['band']:<18} "
-            f"{row['index_guided']:>6.3f}  "
-            f"{row['index_minkpp']:>6.3f}  "
-            f"{row['index_order']:>5.3f}"
+            f"{_fmt(row['contamination_index'], 5)}   "
+            f"{row['band']:<22} "
+            f"{_fmt(row['index_guided'], 6)}  "
+            f"{_fmt(row['index_minkpp'], 6)}  "
+            f"{_fmt(row['index_order'], 5)}  "
+            f"{_fmt(row['loss_auc'], 8)}"
         )
 
 
@@ -446,6 +481,20 @@ def parser() -> ArgumentParser:
     )
     argument_parser.add_argument("--batch-size", type=int, default=4)
     argument_parser.add_argument("--max-length", type=int, default=256)
+    argument_parser.add_argument(
+        "--order-canaries",
+        action="store_true",
+        help=(
+            "Also train on concatenated canonical shards. Leave this off for "
+            "the membership run; the order test scores those same strings."
+        ),
+    )
+    argument_parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=RESULTS_DIR,
+        help="Directory for the JSON reports. The historical rank-p run lives in experiments/results.",
+    )
     argument_parser.add_argument("--no-fallback", action="store_true")
     return argument_parser
 
@@ -487,6 +536,7 @@ def main() -> int:
                 learning_rate=learning_rate,
                 batch_size=args.batch_size,
                 max_length=args.max_length,
+                include_order_canaries=args.order_canaries,
             )
         except (OSError, RuntimeError, ValueError) as error:
             attempts.append({"model_id": model_id, "error": str(error)})
@@ -517,7 +567,7 @@ def main() -> int:
     selected_metadata["seed"] = args.seed
     selected_metadata["leak_set"] = str(leak_path)
     selected_metadata["clean_set"] = str(clean_path)
-    write_results(selected_reports, selected_metadata)
+    write_results(selected_reports, selected_metadata, args.output_dir)
     print("\nSelected validation result")
     print_comparison(selected_reports)
     if not selected_metadata["clear_separation"]:
@@ -525,7 +575,7 @@ def main() -> int:
             "The controlled effect is small at this model scale. "
             "The saved reports contain the measured values."
         )
-    print(f"Results written to {RESULTS_DIR}")
+    print(f"Results written to {args.output_dir}")
     return 0
 
 
