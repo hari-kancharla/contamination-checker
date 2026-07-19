@@ -774,3 +774,109 @@ def summarize(cases):
                            "full_only_accepted": sorted(full_ids - other_accepted),
                            "comparator_only_accepted": sorted(other_accepted - full_ids)})
     return summaries, paired
+
+
+def evaluate(args):
+    started = time.perf_counter()
+    manifest_path = args.output / "sealed_manifest.json"
+    manifest = read_json(manifest_path)
+    seal_hash = read_json(args.output / "seal_receipt.json")["sealed_manifest_sha256"]
+    if hash_file(manifest_path) != seal_hash:
+        raise ValueError("Sealed manifest changed")
+    if (args.output / "evaluation.json").exists() or (args.output / "case_results.jsonl").exists():
+        raise FileExistsError("An evaluation exists; heldout results cannot be overwritten")
+    verify_sources(manifest["sources"])
+    for relative, expected in manifest["artifacts"].items():
+        if hash_file(args.output / relative) != expected:
+            raise ValueError(f"Sealed artifact changed: {relative}")
+    data = collect_data(Path(manifest["snapshot"]), Path(manifest["audit_dir"]))
+    cases = read_jsonl(args.output / "case_assignments.jsonl")
+    calibration = read_json(args.output / "origin_calibration.json")
+    with gzip.open(args.output / "blind_dev_model.json.gz", "rt") as stream:
+        blind_model = json.load(stream)
+    origin = Origin(data)
+    results = []
+    per_case = {}
+    execution = {"status": "running", "sealed_manifest_sha256": seal_hash, "started_utc": datetime.now(timezone.utc).isoformat(),
+                 "target_model_calls": 0, "upstream_code_executed": False, "outcomes_previously_computed": False}
+    write_json(args.output / "evaluation.json", execution)
+    try:
+        # Origin gate and text fingerprint are model-independent; fit once per
+        # sealed case, then use the exact same diagnostics for all four sizes.
+        for index, case in enumerate(cases):
+            ids = case["suspect"] + case["reference"]
+            if case["construction_status"] == "available":
+                origin_result = origin.score(case["suspect"], case["reference"])
+                fingerprint = domain_fingerprint([data.by_id[r]["text"] for r in case["suspect"]],
+                                                 [data.by_id[r]["text"] for r in case["reference"]])
+            else:
+                origin_result = {"status": "unavailable_case_construction", "statistic": None, "folds": []}
+                fingerprint = None
+            per_case[case["case_id"]] = {"origin": origin_result, "fingerprint": fingerprint}
+            for model in MODELS:
+                result = analyze_case(case, data, model, origin_result, calibration["threshold"], fingerprint)
+                results.append(result)
+            print(f"Evaluated fixed case {index + 1}/{len(cases)}: {case['case_id']}", flush=True)
+        summaries, paired = summarize(results)
+        blind_results, blind_rows = blind_evaluate(data, blind_model)
+        verify_sources(manifest["sources"])
+        if hash_file(manifest_path) != seal_hash:
+            raise ValueError("Seal changed during evaluation")
+        write_jsonl(args.output / "case_results.jsonl", results)
+        write_json(args.output / "summary_counts.json", summaries)
+        write_json(args.output / "paired_differences.json", paired)
+        write_json(args.output / "blind_baseline_results.json", blind_results)
+        write_jsonl(args.output / "blind_baseline_predictions.jsonl", blind_rows)
+        write_json(args.output / "origin_case_fits.json", per_case)
+        unique = defaultdict(set)
+        footprint = {}
+        for result in results:
+            if result["bank"] == "primary" and result["common_quality"]["status"] == "complete":
+                for vector in result["vectors"]:
+                    unique[result["model"]].add(vector["row_id"])
+        for model, identifiers in unique.items():
+            footprint[model] = {"unique_real_records_in_primary_cases": len(identifiers),
+                                "stored_scored_targets_unique_records": sum(data.by_id[r]["scores"][model]["MinK++"]["token_count"] for r in identifiers),
+                                "target_model_calls_for_study": 0}
+        execution.update(status="complete", outcomes_computed=True, wall_seconds=time.perf_counter() - started,
+                         case_templates=len(cases), model_case_views=len(results),
+                         origin_test_fit_counts=dict(origin.fit_counts), blind_dev_classifier_fits=1,
+                         source_hashes_unchanged_after_evaluation=True, stored_target_footprint=footprint,
+                         caveats=["Finite heterogeneous bank; no population-FPR confidence claim",
+                                  "Other sizes, conditions, mismatch stress and provenance sensitivities are dependent views",
+                                  "Origin threshold is dev-fitted heuristic; partition views are not independent blocks",
+                                  "Effective scored-token identity absent; this validates only observable saved-vector policy variant",
+                                  "Model-free blind baseline is supervised on dev membership labels",
+                                  "Retrospective public benchmark after source inspection, not blinded preregistration"],
+                         individual_screen={"q": .1, "controls": 8, "minimum_p": 1 / 9, "flags_structurally_zero": True})
+    except BaseException as exc:
+        execution.update(status="failed", wall_seconds=time.perf_counter() - started,
+                         error_type=type(exc).__name__, error=str(exc), model_case_views_completed=len(results))
+        if results:
+            write_jsonl(args.output / "partial_case_results.jsonl", results)
+        raise
+    finally:
+        write_json(args.output / "evaluation.json", execution)
+    hashes = {str(p.relative_to(args.output)): hash_file(p) for p in sorted(args.output.rglob("*")) if p.is_file()}
+    write_json(args.output / "final_artifact_hashes.json", hashes)
+    print(json.dumps({k: execution[k] for k in ("status", "wall_seconds", "case_templates", "model_case_views",
+                                               "origin_test_fit_counts", "stored_target_footprint")}, indent=2), flush=True)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("phase", choices=("seal", "evaluate"))
+    parser.add_argument("--snapshot", type=Path, default=PROJECT / ".cache/research/olmo_detect/OLMo-Detect-6eb88de34a09dea85c4b41deff4048e5a203e1b0")
+    parser.add_argument("--audit-dir", type=Path, default=PROJECT / "experiments/results/olmo-release-audit/reconstruction-2026-11-07-v2")
+    parser.add_argument("--protocol", type=Path, default=PROJECT / "experiments/protocols/real-data-selectivity-v1.json")
+    parser.add_argument("--output", type=Path, required=True)
+    args = parser.parse_args()
+    with threadpool_limits(limits=1):
+        if args.phase == "seal":
+            seal(args)
+        else:
+            evaluate(args)
+
+
+if __name__ == "__main__":
+    main()
