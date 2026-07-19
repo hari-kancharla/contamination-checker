@@ -243,3 +243,135 @@ def scalar_projection(record):
     projection["variants"] = {name: {key: value for key, value in section.items() if key not in {"per_token", "mink_selected_indices", "minkpp_selected_indices"}} for name, section in record["variants"].items()}
     projection["pandora_comparators"] = {name: {key: value for key, value in section.items() if key not in {"per_token", "selected_indices"}} for name, section in record["pandora_comparators"].items()}
     return projection
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--study-run", type=Path, required=True)
+    parser.add_argument("--sealed-data", type=Path, required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    args = parser.parse_args(argv)
+    require(not args.output.exists(), "Output must be a new directory.")
+    args.output.mkdir(parents=True, exist_ok=False)
+    report_path = args.output / "verification.json"
+    own_source_hash = sha(Path(__file__))
+    report = {"status": "preflight", "scope": "All required aggregate reconstruction from saved vectors; no model/logit recomputation, AUC, threshold tuning, optional-score imputation, or membership-label validation.",
+              "settings": {key: str(value.resolve()) for key, value in vars(args).items()},
+              "python": sys.version, "platform": platform.platform(), "zlib_version": zlib.ZLIB_VERSION,
+              "zlib_runtime_version": zlib.ZLIB_RUNTIME_VERSION, "source_sha256": own_source_hash,
+              "bound": {"unit_roundoff_fp32": U32, "unit_roundoff_fp64": U64,
+                        "reduction": "gamma_n*fsum(abs(stored_inputs)) + n*2^-126/(1-n*u32); gamma_n=n*u32/(1-n*u32)",
+                        "fp32_final_division": "gamma_2*(abs(fsum(inputs))+reduction_bound)/divisor + 2*2^-126/(1-2*u32); allows reciprocal rounding plus multiplication",
+                        "zlib_final_division": "gamma_1(fp64)*(abs(fsum(inputs))+reduction_bound)/exact_compressed_bytes",
+                        "host_bookkeeping": "4*ulp(fsum(inputs))/divisor + 4*ulp(reference_quotient); final total rounded upward with nextafter",
+                        "assumptions": "No overflow; operations at least FP32 with correctly rounded results (or FP32 reciprocal then product); additive minimum-normal terms cover flushed subnormal results. Internal accumulator precision is not inferred.",
+                        "limitations": "A conservative compatibility bound on aggregates conditional on stored token vectors, not per-token/model correctness, bitwise replay, power/FDR, or label provenance."},
+              "counts": {}, "metrics": {}, "verified_artifacts_sha256": {}}
+    started = time.perf_counter()
+    counts = Counter()
+    try:
+        execution_path = args.study_run / "execution.json"
+        execution_hash = sha(execution_path)
+        execution = read_json(execution_path)
+        require(execution["status"] == "complete" and execution["scored_records"] == execution["planned_scored_records"] == N,
+                "Only the completed fixed 3000-record run can be verified, after its process exits.")
+        require(execution["model_repo"] == MODEL_REPO and execution["model_revision"] == MODEL_REVISION and
+                execution["source_sha256"]["real_score_engine.py"] == ENGINE_SHA256,
+                "Wrong pinned model/engine identity.")
+        artifacts = {str(execution_path.resolve()): execution_hash}
+        for name, expected in execution["source_sha256"].items():
+            path = relative_file(args.study_run, name)
+            require(sha(path) == expected, f"Frozen source changed: {name}.")
+            artifacts[str(path.resolve())] = expected
+        for path, expected in ((args.study_run / "scores.jsonl", execution["scores_sha256"]),
+                               (args.study_run / "protocol.json", execution["protocol_sha256"]),
+                               (args.study_run / "amendment.json", execution["amendment_sha256"]),
+                               (args.sealed_data / "seal.json", execution["seal_sha256"])):
+            require(sha(path) == expected, f"Completed artifact changed: {path}.")
+            artifacts[str(path.resolve())] = expected
+        seal = read_json(args.sealed_data / "seal.json")
+        require(seal["dataset"] == DATASET_REPO and seal["dataset_revision"] == DATASET_REVISION, "Wrong dataset identity.")
+        for name, expected in seal["files_sha256"].items():
+            path = relative_file(args.sealed_data, name)
+            require(sha(path) == expected, f"Sealed source artifact changed: {name}.")
+            artifacts[str(path.resolve())] = expected
+        require(sha(args.sealed_data / "protocol.json") == execution["protocol_sha256"], "Scoring/data protocol mismatch.")
+        receipts = read_json(args.sealed_data / "download_receipts.json")
+        model_receipts = [row for row in receipts if row["repo_type"] == "model" and row["repo_id"] == MODEL_REPO and row["revision"] == MODEL_REVISION]
+        require(len(model_receipts) == 1 and model_receipts[0]["files"] == execution["model_files_verified"] and
+                model_receipts[0]["files"]["model.safetensors"]["sha256"] == MODEL_WEIGHT_SHA256,
+                "Recorded model content receipt differs from the pinned checkpoint/execution.")
+        report["weight_receipt_scope"] = "Binds the completed execution's recorded weight verification to the sealed pinned receipt; this model-free verifier does not reread checkpoint weights."
+        amendment = read_json(args.study_run / "amendment.json")
+        require(amendment["failure_accounting"] == execution["failure_accounting"] and
+                set(execution["failure_accounting"]["required_complete_variants"]) == set(REQUIRED) and
+                execution["failure_accounting"]["required_complete_pandora_comparators"] == ["fp32"], "Required-section policy differs.")
+        shutil.copy2(Path(__file__), args.output / Path(__file__).name)
+        sources, ordered_ids = {}, []
+        with gzip.open(args.sealed_data / "inputs.jsonl.gz", "rb") as stream:
+            for raw in stream:
+                source = decode(raw)
+                if source["study_split"] == "test" or source["official_label"] == 0:
+                    require(source["id"] not in sources, "Duplicate sealed input ID.")
+                    sources[source["id"]] = source
+                    ordered_ids.append(source["id"])
+        require(len(sources) == N, "Scored source cohort is not the fixed 3000 records.")
+        shard_paths = [Path(shard["path"]).resolve() for shard in execution["vector_shards"]]
+        require(len(shard_paths) == len(set(shard_paths)) == 30 and execution["vector_records_per_shard"] == 100,
+                "Wrong shard count or repeated shard paths.")
+        optional_ledger = []
+        with (args.study_run / "scores.jsonl").open("rb") as scalars:
+            for shard_index, (shard, path) in enumerate(zip(execution["vector_shards"], shard_paths)):
+                report["current_shard"] = str(path)
+                require(path.parent == Path(execution["vector_directory"]).resolve() and path.name == f"tokens-{shard_index:04d}.jsonl.gz" and
+                        path.stat().st_size == shard["bytes"] and sha(path) == shard["sha256"], "Raw vector shard identity differs.")
+                artifacts[str(path)] = shard["sha256"]
+                rows = 0
+                with gzip.open(path, "rb") as vectors:
+                    for row_index, raw in enumerate(vectors):
+                        raw_scalar = scalars.readline()
+                        require(raw_scalar and counts["records"] < N, "Missing scalar or excess vector record.")
+                        scalar, record = decode(raw_scalar), decode(raw)
+                        report["current_record_id"] = record["id"]
+                        link = scalar["full_vector_record"]
+                        require(Path(link["path"]).resolve() == path and link["row_index"] == row_index and
+                                link["uncompressed_record_sha256"] == hashlib.sha256(raw).hexdigest(), "Scalar/vector row hash or shard link differs.")
+                        expected = scalar_projection(record)
+                        expected["full_vector_record"] = link
+                        require(scalar == expected, "Scalar is not the exact projection of its raw vector record.")
+                        require(record["id"] == ordered_ids[counts["records"]] and
+                                record["checkpoint_identity"] == execution["checkpoint_identity"], "Record order/model identity differs.")
+                        unavailable = verify_record(record, sources[record["id"]], report["metrics"], counts)
+                        if unavailable:
+                            optional_ledger.append({"id": record["id"], "split": record["source"]["study_split"],
+                                                    "official_label": record["source"]["official_label"], "failed_sections": sorted(unavailable)})
+                        counts["records"] += 1
+                        rows += 1
+                require(rows == 100, "A fixed shard does not contain exactly 100 vector records.")
+                counts["shards"] += 1
+                print(json.dumps({"verified_records": counts["records"], "shards": counts["shards"]}), flush=True)
+            require(not scalars.readline(), "Scalar artifact has unmatched extra rows.")
+        require(counts["records"] == N and len(report["metrics"]) == 12 and
+                all(metric["count"] == N for metric in report["metrics"].values()), "Aggregate coverage is incomplete.")
+        expected_ledger = [{**row, "failed_sections": sorted(row["failed_sections"])} for row in execution["optional_failure_records"]]
+        require(optional_ledger == expected_ledger and len(optional_ledger) == execution["optional_failure_record_count"], "Completed optional-failure ledger differs.")
+        counts["optional_unavailable_records_preserved"] = len(optional_ledger)
+        counts["aggregate_reconstructions"] = sum(row["count"] for row in report["metrics"].values())
+        counts["aggregate_discrepancies_outside_declared_bound"] = sum(row["outside_bound_count"] for row in report["metrics"].values())
+        for path, expected in artifacts.items():
+            require(sha(path) == expected, f"Read-only input changed during verification: {path}.")
+        require(sha(Path(__file__)) == own_source_hash, "Verifier source changed during execution.")
+        report["verified_artifacts_sha256"] = artifacts
+        report["status"] = "pass_all_required_aggregates_within_declared_bound" if not counts["aggregate_discrepancies_outside_declared_bound"] else "fail_aggregate_discrepancy_outside_declared_bound"
+        return 0 if report["status"].startswith("pass_") else 1
+    except BaseException as error:
+        report.update(status="failed_integrity_or_incomplete_verification", error_type=type(error).__name__, error=str(error))
+        raise
+    finally:
+        report.update(counts=dict(counts), wall_seconds=time.perf_counter() - started)
+        with report_path.open("xb") as stream:
+            stream.write(encoded(report))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
