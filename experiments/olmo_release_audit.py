@@ -568,3 +568,120 @@ class Audit:
                                "outside_0_1": sum(not 0 <= v <= 1 for v in observed),
                                "status": "publisher_reported_values_only_not_recomputed_corpus_overlap"})
         return checks
+
+
+def run(args: argparse.Namespace) -> dict:
+    snapshot = args.snapshot.resolve()
+    output = args.output.resolve()
+    if not snapshot.is_dir():
+        raise FileNotFoundError(snapshot)
+    if output == snapshot or snapshot in output.parents:
+        raise ValueError("Audit output must be outside the upstream snapshot")
+    output.mkdir(parents=True, exist_ok=False)
+    audit = Audit(snapshot, output)
+    try:
+        receipt = json.loads(audit.read(args.receipt))
+        revision = receipt.get("revision")
+        if revision != REVISION or snapshot.name != f"OLMo-Detect-{revision}":
+            raise ValueError("Snapshot/receipt does not identify the expected pinned revision")
+        archive = snapshot.parent / f"{revision}.tar.gz"
+        archive_sha = file_hash(archive) if archive.exists() else None
+        if archive_sha != receipt.get("archive_sha256") or archive_sha != ARCHIVE_SHA256:
+            raise ValueError("Missing archive or archive SHA256 differs from the source receipt")
+        audit.load_benchmark()
+        audit.load_scores()
+        metrics, aggregates = audit.metrics()
+        overlap_checks = audit.reported_overlap_checks()
+        code_evidence = audit.source_evidence()
+        paper = compare_paper(audit.read(args.paper_html), metrics, aggregates) if args.paper_html else {
+            "source_url": PAPER_URL, "status": "not_compared_no_local_paper_HTML_supplied"}
+        verified_sources = audit.verify_archive_sources(archive)
+        physical = [i for i in audit.score_files if i["path"].endswith("/minkprob.json")]
+        token_counts = [r["token_count"] for r in audit.rows if r["method"] == "MinK" and r["token_count"] is not None]
+        summary = {
+            "schema_version": 1, "created_utc": datetime.now(timezone.utc).isoformat(),
+            "estimand": "Discrimination of the publisher's original-pretraining corpus membership labels using the publisher's released scores on final OLMo2 Instruct models.",
+            "scope": "External saved-score reconstruction and data-quality audit; not fresh model scoring, independently verified training-stream inclusion, a new attack, calibrated FPR, or benchmark-performance inflation.",
+            "snapshot": str(snapshot), "repository_revision": revision, "source_receipt": receipt,
+            "archive_sha256_verified": archive_sha, "audit_script_sha256": file_hash(Path(__file__)),
+            "consumed_snapshot_sources_verified_against_archive": verified_sources,
+            "python": platform.python_version(), "upstream_code_executed": False, "network_requests": 0,
+            "benchmark_files": len(audit.benchmark_files), "benchmark_rows": len(audit.benchmark),
+            "benchmark_unique_stripped_text_sha256": len({r["text_hash"] for r in audit.benchmark}),
+            "nonmember_overlap_metadata": {"checks": len(overlap_checks),
+                                           "missing_or_invalid_fields": sum(r["missing_or_invalid"] for r in overlap_checks),
+                                           "fields_at_or_above_0_2": sum(r["at_or_above_0_2"] for r in overlap_checks),
+                                           "status": "publisher_reported_fields_checked_not_independently_recomputed"},
+            "score_files": len(audit.score_files), "normalized_method_rows": len(audit.rows),
+            "physical_scored_inputs_across_models": sum(i["rows"] for i in physical),
+            "unique_physical_scored_inputs_note": "Count includes separate model evaluations and matched/shifted membership sets; excludes duplicate method columns and repeated nonmember use across conditions.",
+            "unjoined_method_rows": sum(r["join_status"] != "unique_exact_stripped_text_hash" for r in audit.rows),
+            "leaf_AUC_cells": len(metrics), "available_leaf_AUC_cells": sum(r["auc"] is not None for r in metrics),
+            "available_test_cells": sum(r["auc"] is not None and r["split"] == "test" for r in metrics),
+            "available_dev_cells": sum(r["auc"] is not None and r["split"] == "dev" for r in metrics),
+            "complete_available_cells": sum(r["auc"] is not None and r["complete"] for r in metrics),
+            "token_count_coverage_unduplicated_by_method": count_summary(token_counts),
+            "token_budget_interpretation": "Saved next-token target counts above 1024 rule out a universal 1024-token scoring cap for these files. Maximum 4095 and current code's 4096 input cap are consistent. Counts do not recover exact token IDs, tokenizer/model revisions, precision, or historical settings.",
+            "paper_stated_input_limits": {"source_url": PAPER_URL + "#A8", "nongenerative": 1024, "generative": 4096,
+                                          "status": "Manually verified in Appendix H of the saved v1 HTML; conflicts with the longer released saved target counts."},
+            "manifest_present_files": sum(i["run_manifest_present"] for i in audit.score_files),
+            "missing_historical_provenance": ["model weight revision/hash", "tokenizer revision and actual token-ID vectors", "numeric precision/quantization", "hardware/software versions", "historic k fraction and floor implementation per saved file", "unconsolidated source run identity/time", "per-file truncation and special-token settings"],
+            "method_provenance": {"score_orientation": "All three saved scores kept unchanged, higher=member. LOSS is mean log likelihood (negative NLL), not positive cross entropy.",
+                                  "current_source_k": 0.2, "current_source_tail_rule": "max(1, floor(k * scored_target_count))",
+                                  "historical_k_status": "Not present in saved files; current source is supporting context, not a run manifest.",
+                                  "min_k_pp_normalization": "Current source computes log-softmax, vocabulary expectation and variance, sqrt(clamp(variance,min=1e-9)), then divides centered target logprob by sigma+1e-9.",
+                                  "token_count_definition": "Publisher stores number of next-token targets, after exclusion of first input token/trailing EOS in the current adapter; actual historical masks unavailable."},
+            "canonical_rows": {"path": "normalized_rows.jsonl", "grain": "one physical saved sample × method × model, joined by exact stripped-text hash within source leaf; nonmembers condition=shared, not duplicated for matched/shifted",
+                               "unique_key": ["method", "model", "domain", "subset", "condition", "split", "text_hash"],
+                               "text_hash": "SHA256 of UTF-8 text.strip(); the released 80-bit text_sha1 is the intermediate join key, checked within the source leaf and split. Split follows the publisher's filename contract: _test removed, _dev retained.",
+                               "label_provenance": "Directory labels from the official benchmark; label1=member, label0=non-member. Corpus provenance/13gram filtering claims are from the publisher, not re-executed here.",
+                               "safe_filter": "join_status=unique_exact_stripped_text_hash and numeric score; use nonmember rows once, split=test, for any subsequent explicitly sealed internal calibration/evaluation partition"},
+            "warnings": ["The release has no raw dev scores for these methods; using subsets of test for internal calibration is a new evaluation protocol and must be disclosed.",
+                         "Nonmembers are shared between matched and shifted conditions; these are dependent comparisons.",
+                         "Published table aggregation is hierarchical macro; evaluate.py instead pools and contains an obsolete Assembly leaf. They are different statistics.",
+                         "Input-text uniqueness is not proof of effective token-prefix uniqueness: saved token IDs are absent.",
+                         "Tar extraction mtime cannot establish original scoring chronology; vintage inference is withheld.",
+                         "No bootstrap intervals or significance tests are asserted by this reconstruction; table85 point changes only are compared."],
+            "paper_comparison": {k: v for k, v in paper.items() if k != "comparisons"},
+            "issues_by_severity": dict(Counter(i["severity"] for i in audit.issues)),
+            "issues_by_kind": dict(Counter(i["kind"] for i in audit.issues)),
+        }
+        write_jsonl(output / "normalized_rows.jsonl", audit.rows)
+        write_jsonl(output / "benchmark_rows.jsonl", audit.benchmark)
+        dump_json(output / "benchmark_files.json", audit.benchmark_files)
+        dump_json(output / "score_files.json", audit.score_files)
+        dump_json(output / "leaf_metrics.json", metrics)
+        dump_json(output / "aggregate_metrics.json", aggregates)
+        dump_json(output / "paper_comparison.json", paper)
+        dump_json(output / "reported_overlap_checks.json", overlap_checks)
+        dump_json(output / "issues.json", audit.issues)
+        dump_json(output / "source_code_evidence.json", code_evidence)
+        dump_json(output / "sources.json", audit.sources)
+        dump_json(output / "summary.json", summary)
+        (output / "audit_script.py").write_bytes(Path(__file__).read_bytes())
+        artifact_hashes = {p.name: file_hash(p) for p in sorted(output.iterdir()) if p.is_file()}
+        dump_json(output / "artifact_hashes.json", artifact_hashes)
+        return summary
+    except Exception as exc:
+        dump_json(output / "failure.json", {"type": type(exc).__name__, "message": str(exc),
+                                           "upstream_code_executed": False})
+        raise
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--snapshot", type=Path, default=Path(f".cache/research/olmo_detect/OLMo-Detect-{REVISION}"))
+    parser.add_argument("--receipt", type=Path, default=Path(".cache/research/olmo_detect/source_receipt.json"))
+    parser.add_argument("--paper-html", type=Path, help="Optional previously downloaded arXiv v1 HTML, for displayed-table comparisons")
+    parser.add_argument("--output", type=Path, required=True, help="New output directory; existing directories are rejected")
+    args = parser.parse_args()
+    summary = run(args)
+    print(json.dumps({k: summary[k] for k in ("benchmark_rows", "score_files", "normalized_method_rows",
+                                              "available_test_cells", "available_dev_cells", "paper_comparison",
+                                              "issues_by_severity", "token_count_coverage_unduplicated_by_method")}, indent=2))
+    if summary["issues_by_severity"].get("error", 0):
+        sys.exit(2)
+
+
+if __name__ == "__main__":
+    main()
