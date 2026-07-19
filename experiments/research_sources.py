@@ -286,3 +286,212 @@ def verify_archive_tree(archive, destination, expected_root):
             if path.stat().st_size != member.size or file_hash(path) != h.hexdigest():
                 return {"status": "tree_content_mismatch", "path": str(path)}
     return {"status": "verified", "path": str(destination), "files": len(expected_files)}
+
+
+def validate_reproduction_amendment(output):
+    if output.exists() or output.is_symlink():
+        raise FileExistsError(f"Refusing to replace reproduction amendment: {output}")
+    original_path = PROJECT / "experiments/protocols/checkmia-weighted-vs-uniform-v1-amendment-1.json"
+    prior_path = PROJECT / "experiments/results/checkmia-real-v1/scoring/execution.json"
+    if not original_path.is_file() or file_hash(original_path) != HISTORICAL_AMENDMENT_SHA:
+        raise ValueError("Original frozen amendment is missing/changed; do not recreate its history")
+    if not prior_path.is_file() or file_hash(prior_path) != HISTORICAL_FAILURE_SHA:
+        raise ValueError("Byte-identical historical failed execution is required in the evidence bundle; it is not downloaded or fabricated")
+    original = json.loads(original_path.read_text())
+    prior = json.loads(prior_path.read_text())
+    if prior["status"] != "failed" or prior["scored_records"] != 1:
+        raise ValueError("Historical failure is not the declared one-development-record event")
+    if file_hash(prior_path.parent / "scores.jsonl") != prior["scores_sha256"]:
+        raise ValueError("Historical failed score record changed")
+    rows = [json.loads(line) for line in (prior_path.parent / "scores.jsonl").read_text().splitlines() if line.strip()]
+    if len(rows) != 1 or rows[0]["source"]["study_split"] != "dev":
+        raise ValueError("Historical failure does not contain only the declared development record")
+    if "protocol_sha256" in prior and file_hash(prior_path.parent / "protocol.json") != prior["protocol_sha256"]:
+        raise ValueError("Historical frozen protocol changed")
+    for name, expected in prior["source_sha256"].items():
+        if file_hash(prior_path.parent / name) != expected:
+            raise ValueError(f"Historical frozen source changed: {name}")
+    updated = json.loads(json.dumps(original))
+    old_path = updated["pretest_evidence"]["failed_execution"]
+    updated["pretest_evidence"]["failed_execution"] = str(prior_path.resolve())
+    updated["reproduction_path_remap"] = {
+        "scope": "Path-only relocation of immutable historical evidence; no assignment, formula, threshold or cohort change",
+        "original_amendment_sha256": HISTORICAL_AMENDMENT_SHA,
+        "original_failed_execution_path": old_path, "local_failed_execution_path": str(prior_path.resolve()),
+        "failed_execution_sha256_unchanged": HISTORICAL_FAILURE_SHA,
+        "historical_source_sha256_unchanged": prior["source_sha256"],
+        "original_amendment_left_unchanged": True,
+    }
+    return updated
+
+
+def preserve_or_create_receipts(root, verified_assets):
+    """Export compatibility receipts only after all relevant assets verified."""
+    changes = []
+    if "olmo-detect" in verified_assets:
+        path = root / "olmo_detect/source_receipt.json"
+        expected = {"repository": "https://github.com/LuckyDaydreamer/OLMo-Detect", "revision": OLMO_REVISION,
+                    "archive_bytes": OLMO_ARCHIVE["bytes"], "archive_sha256": OLMO_ARCHIVE["sha256"],
+                    "snapshot": str((root / "olmo_detect" / f"OLMo-Detect-{OLMO_REVISION}").resolve()),
+                    "purpose": "Pinned content verified by research_sources.py; no upstream code executed."}
+        if path.exists():
+            observed = json.loads(path.read_text())
+            if any(observed.get(k) != expected[k] for k in ("repository", "revision", "archive_bytes", "archive_sha256")):
+                raise ValueError("Existing OLMo receipt conflicts; it was preserved")
+            changes.append({"path": str(path), "status": "existing_compatible_receipt_preserved"})
+        else:
+            write_new_json(path, expected)
+            changes.append({"path": str(path), "status": "created_verified_receipt"})
+    if all(asset["asset"] in verified_assets for asset in HF_ASSETS):
+        path = root / "real_study_download_receipts.json"
+        expected = [{"repo_id": a["repo_id"], "repo_type": a["repo_type"], "revision": a["revision"],
+                     "path": str(hf_path(root, a).resolve()), "files": a["files"],
+                     "verification_basis": "Pinned registry file bytes/SHA256 independently checked at this root"} for a in HF_ASSETS]
+        if path.exists():
+            observed = json.loads(path.read_text())
+            for entry in expected:
+                match = [r for r in observed if all(r.get(k) == entry[k] for k in ("repo_id", "repo_type", "revision"))]
+                if len(match) != 1 or match[0].get("files") != entry["files"]:
+                    raise ValueError("Existing HF receipt conflicts; it was preserved")
+            changes.append({"path": str(path), "status": "existing_compatible_receipt_preserved"})
+        else:
+            write_new_json(path, expected)
+            changes.append({"path": str(path), "status": "created_verified_receipt"})
+    else:
+        changes.append({"status": "HF_compatibility_receipt_not_written_until_all3_HF_assets_verified"})
+    return changes
+
+
+def extraction_selftest():
+    """Small archive-path ENGINEERING test; no research data/results are made."""
+    rejected = []
+    cases = ["../escape", "/absolute", "Expected/../../escape", "Expected/../escape", "C:/escape", "Expected/a\\b"]
+    for name in cases:
+        info = tarfile.TarInfo(name)
+        try:
+            validate_members([info], "Expected")
+        except ValueError:
+            rejected.append(name)
+    for kind in (tarfile.SYMTYPE, tarfile.LNKTYPE, tarfile.FIFOTYPE):
+        info = tarfile.TarInfo("Expected/link")
+        info.type = kind
+        info.linkname = "../../outside"
+        try:
+            validate_members([info], "Expected")
+        except ValueError:
+            rejected.append(str(kind))
+    duplicate = tarfile.TarInfo("Expected/file")
+    for members in ([duplicate, duplicate], [tarfile.TarInfo("Expected/a"), tarfile.TarInfo("Expected/a/child")],
+                    [tarfile.TarInfo("Expected/A"), tarfile.TarInfo("Expected/a/child")]):
+        try:
+            validate_members(members, "Expected")
+        except ValueError:
+            rejected.append("duplicate_or_parent_file")
+    if len(rejected) != 12:
+        raise AssertionError("Archive validator did not reject every unsafe case")
+    with tempfile.TemporaryDirectory(prefix="contamcheckr-archive-path-test-") as temporary:
+        root = Path(temporary)
+        archive = root / "tiny.tar.gz"
+        content = b"archive path engineering check\n"
+        with tarfile.open(archive, "w:gz") as stream:
+            info = tarfile.TarInfo("Expected/file.txt")
+            info.size = len(content)
+            stream.addfile(info, io.BytesIO(content))
+        target = root / "Expected"
+        extract_new_archive(archive, target, "Expected")
+        before = file_hash(target / "file.txt")
+        try:
+            extract_new_archive(archive, target, "Expected")
+        except FileExistsError:
+            pass
+        else:
+            raise AssertionError("Existing archive destination was overwritten")
+        if file_hash(target / "file.txt") != before or verify_archive_tree(archive, target, "Expected")["status"] != "verified":
+            raise AssertionError("Tiny archive content changed")
+    return {"status": "passed", "scope": "archive path/type/non-overwrite engineering only; no dummy research evidence", "unsafe_cases_rejected": len(rejected),
+            "temporary_directory_cleaned": True, "downloads": 0, "models_loaded": 0}
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--root", type=Path, default=PROJECT / ".cache/research")
+    parser.add_argument("--download", action="store_true", help="Explicitly download only missing public assets, extract a missing archive tree and create missing compatible receipts")
+    parser.add_argument("--asset", nargs="+", choices=("olmo-detect", *[a["asset"] for a in HF_ASSETS]), help="Subset; default all4assets. Full HF compatibility receipt requires all3HF assets verified in this invocation")
+    parser.add_argument("--timeout", type=int, default=60, help="Network timeout only when --download is supplied")
+    parser.add_argument("--list", action="store_true", help="Print registry identities/software provenance without reading or writing assets")
+    parser.add_argument("--self-test-extraction", action="store_true", help="Create/clean one tiny temporary engineering archive; no source downloads or research outcomes")
+    parser.add_argument("--reproduction-amendment", type=Path, help="Explicitly create a NEW path-only amendment view after verifying immutable historical failure evidence; never edits original")
+    args = parser.parse_args()
+    if args.list and (args.download or args.self_test_extraction or args.reproduction_amendment):
+        parser.error("Registry listing must be separate from explicit write actions")
+    if args.list:
+        print(json.dumps({"OLMo_Detect": OLMO_ARCHIVE, "OLMo_revision": OLMO_REVISION,
+                          "HF_assets": HF_ASSETS, "observed_environment": OBSERVED_ENVIRONMENT}, indent=2))
+        return
+    if args.self_test_extraction:
+        if args.download or args.reproduction_amendment:
+            parser.error("Engineering path test must be separate from downloads/amendment creation")
+        print(json.dumps(extraction_selftest(), indent=2))
+        return
+    amendment = validate_reproduction_amendment(args.reproduction_amendment) if args.reproduction_amendment else None
+    started = time.perf_counter()
+    root = args.root.expanduser().resolve()
+    selected = set(args.asset or ("olmo-detect", *[a["asset"] for a in HF_ASSETS]))
+    files, downloaded, verified = [], [], set()
+    for asset in HF_ASSETS:
+        if asset["asset"] not in selected:
+            continue
+        outcomes = []
+        for name, expected in asset["files"].items():
+            path = hf_path(root, asset) / name
+            outcome = verify_file(path, expected)
+            if outcome["status"] == "missing" and args.download:
+                prefix = "datasets/" if asset["repo_type"] == "dataset" else ""
+                url = f"https://huggingface.co/{prefix}{quote(asset['repo_id'], safe='/')}/resolve/{asset['revision']}/{quote(name, safe='/')}?download=true"
+                download_missing(path, expected, url, root=root, timeout=args.timeout)
+                outcome = verify_file(path, expected)
+                downloaded.append(str(path))
+            outcomes.append(outcome)
+        if all(o["status"] == "verified" for o in outcomes):
+            verified.add(asset["asset"])
+        files.extend({"asset": asset["asset"], **o} for o in outcomes)
+    if "olmo-detect" in selected:
+        archive = root / "olmo_detect" / f"{OLMO_REVISION}.tar.gz"
+        outcome = verify_file(archive, OLMO_ARCHIVE)
+        if outcome["status"] == "missing" and args.download:
+            download_missing(archive, OLMO_ARCHIVE, OLMO_ARCHIVE["url"], root=root, timeout=args.timeout)
+            downloaded.append(str(archive))
+            outcome = verify_file(archive, OLMO_ARCHIVE)
+        files.append({"asset": "olmo-detect", **outcome})
+        if outcome["status"] == "verified":
+            destination = root / "olmo_detect" / f"OLMo-Detect-{OLMO_REVISION}"
+            if not destination.exists() and not destination.is_symlink() and args.download:
+                if not destination.parent.resolve().is_relative_to(root):
+                    raise ValueError("Archive destination parent resolves outside the selected source root")
+                extract_new_archive(archive, destination, destination.name)
+            tree = verify_archive_tree(archive, destination, destination.name)
+            files.append({"asset": "olmo-detect", "kind": "extracted_tree", **tree})
+            if tree["status"] == "verified":
+                verified.add("olmo-detect")
+    receipt_actions = preserve_or_create_receipts(root, verified) if args.download else []
+    complete = verified == selected
+    if amendment is not None:
+        if not complete:
+            raise ValueError("Selected sources did not verify; no reproduction amendment was written")
+        write_new_json(args.reproduction_amendment, amendment)
+        receipt_actions.append({"status": "new_path_only_amendment_created", "path": str(args.reproduction_amendment.resolve()),
+                                "sha256": file_hash(args.reproduction_amendment)})
+    report = {"status": "verified" if complete else "missing_or_mismatched_assets", "root": str(root),
+              "mode": "explicit_download_missing_only" if args.download else
+                      "offline_verify_plus_explicit_new_amendment" if amendment is not None else "offline_verify_only",
+              "selected_assets": sorted(selected), "verified_assets": sorted(verified), "files": files,
+              "downloaded_files": downloaded, "receipt_actions": receipt_actions,
+              "wall_seconds": time.perf_counter() - started, "upstream_code_executed": False, "models_loaded": 0,
+              "authentication_handled": False, "MIMIR": "not_required_or_downloaded; preserve separately acquired gated receipt"}
+    print(json.dumps(report, indent=2, sort_keys=True))
+    if not complete:
+        raise SystemExit(2)
+
+
+if __name__ == "__main__":
+    main()
