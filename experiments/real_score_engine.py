@@ -243,3 +243,228 @@ def _vector_payload(tensor: Any) -> list[Any]:
     """Keep JSON standard: nonfinite observations are explicit nulls plus support masks."""
     values = tensor.detach().cpu().tolist()
     return [float(value) if math.isfinite(float(value)) else None for value in values]
+
+
+def score_logits_variants(
+    logits: Any, target_ids: Any, *, k_percent: float = 20.0,
+    chunk_tokens: int = 64, text: str | None = None,
+    include_cpu_float64: bool = False, include_pandora: bool = False,
+    pandora_k_percent: float = 10.0,
+) -> dict[str, Any]:
+    """Compute all variants from the same aligned [targets,vocabulary] logits.
+
+    Vocabulary statistics are bounded by ``chunk_tokens``. The original model
+    logits themselves remain resident. No per-token support is silently dropped.
+    Native versus FP32 changes both log-softmax and arithmetic precision. The
+    fixed-logp diagnostic instead holds FP32 logp/probability/products fixed.
+    Its FP32 moment results are explicitly cast to BF16 after reduction.
+    """
+    import torch
+    import zlib
+    if logits.ndim != 2 or not logits.is_floating_point() or logits.shape[0] < 1:
+        raise ValueError("Expected nonempty floating [targets,vocabulary] logits.")
+    targets = _ids(target_ids)
+    if len(targets) != logits.shape[0] or max(targets) >= logits.shape[1]:
+        raise ValueError("Target IDs must align exactly with logits rows and vocabulary.")
+    if not math.isfinite(k_percent) or not 0 < k_percent <= 100 or chunk_tokens < 1:
+        raise ValueError("k_percent must be in (0,100] and chunk_tokens positive.")
+    if include_pandora and (not math.isfinite(pandora_k_percent) or not 0 < pandora_k_percent <= 100):
+        raise ValueError("pandora_k_percent must be in (0,100].")
+    variants = list(VARIANTS) + (["cpu_float64_centered"] if include_cpu_float64 else [])
+    keys = ("logp", "mu", "variance", "sigma", "z", "clamp_mask", "support")
+    saved: dict[str, dict[str, list[Any]]] = {name: {key: [] for key in keys} for name in variants}
+    component_dtypes: dict[str, dict[str, str]] = {}
+    pandora_saved: dict[str, dict[str, list[Any]]] = {
+        name: {key: [] for key in ("logp", "mean", "std", "z", "support")}
+        for name in ("native", "fp32")
+    } if include_pandora else {}
+    pandora_dtypes: dict[str, dict[str, str]] = {}
+
+    def retain_pandora(name: str, logp: Any, target_logp: Any) -> None:
+        # Pinned Pandora LOSS.py uses unweighted torch.std_mean, correction=1;
+        # this is separate from the probability-weighted Min-K++ variants.
+        std, mean = torch.std_mean(logp, dim=-1, correction=1)
+        z = (target_logp - mean) / (std + 1e-8)
+        support = (torch.isfinite(target_logp) & torch.isfinite(mean) &
+                   torch.isfinite(std) & torch.isfinite(z))
+        for key, value in dict(logp=target_logp, mean=mean, std=std, z=z, support=support).items():
+            pandora_saved[name][key].append(value.detach())
+        pandora_dtypes[name] = {
+            "log_softmax": str(logp.dtype), "mean": str(mean.dtype),
+            "std": str(std.dtype), "normalized_score": str(z.dtype),
+            "computation_device": str(logp.device),
+        }
+
+    def retain(name: str, logp: Any, mu: Any, variance: Any, target_logp: Any,
+               *, normalize_fp32: bool = False, product_dtype: Any = None,
+               reduction_dtype: Any = None) -> None:
+        sigma = variance.clamp(min=VARIANCE_FLOOR).sqrt()
+        if normalize_fp32:
+            z = (target_logp.float() - mu.float()) / (sigma.float() + DENOMINATOR_EPSILON)
+        else:
+            z = (target_logp - mu) / (sigma + DENOMINATOR_EPSILON)
+        support = (torch.isfinite(target_logp) & torch.isfinite(mu) &
+                   torch.isfinite(variance) & torch.isfinite(sigma) & torch.isfinite(z))
+        values = dict(logp=target_logp, mu=mu, variance=variance, sigma=sigma, z=z,
+                      clamp_mask=variance < VARIANCE_FLOOR, support=support)
+        for key, value in values.items():
+            saved[name][key].append(value.detach())
+        component_dtypes[name] = {
+            "log_softmax": str(logp.dtype), "target_logp": str(target_logp.dtype),
+            "moment_product": str(product_dtype or logp.dtype),
+            "moment_reduction": str(reduction_dtype or mu.dtype),
+            "moment_result": str(mu.dtype),
+            "variance": str(variance.dtype), "sigma": str(sigma.dtype), "normalized_score": str(z.dtype),
+            "computation_device": str(logp.device),
+        }
+
+    with torch.inference_mode():
+        for start in range(0, len(targets), chunk_tokens):
+            stop = min(start + chunk_tokens, len(targets))
+            block = logits[start:stop]
+            selected = torch.tensor(targets[start:stop], dtype=torch.long, device=block.device)
+            native_lp = torch.log_softmax(block, dim=-1)
+            native_p = native_lp.exp()
+            native_mu = (native_p * native_lp).sum(dim=-1)
+            native_second = (native_p * native_lp.square()).sum(dim=-1)
+            native_target = native_lp.gather(-1, selected.unsqueeze(-1)).squeeze(-1)
+            retain("author_native", native_lp, native_mu, native_second - native_mu.square(), native_target)
+            if include_pandora:
+                retain_pandora("native", native_lp, native_target)
+
+            lp = native_lp if block.dtype == torch.float32 else torch.log_softmax(block.float(), dim=-1)
+            probability = lp.exp()
+            first_products = probability * lp
+            second_products = probability * lp.square()
+            mu = first_products.sum(dim=-1)
+            second = second_products.sum(dim=-1)
+            target = lp.gather(-1, selected.unsqueeze(-1)).squeeze(-1)
+            if include_pandora:
+                retain_pandora("fp32", lp, target)
+            retain("fp32_second_moment", lp, mu, second - mu.square(), target)
+            centered = (probability * (lp - mu.unsqueeze(-1)).square()).sum(dim=-1)
+            retain("fp32_centered", lp, mu, centered, target)
+
+            # Hold FP32 logp, probabilities and moment products fixed. Only
+            # moment results/variance/sqrt use BF16; target z remains FP32.
+            # Explicit casts occur AFTER the existing FP32 sums. A BF16 dtype
+            # argument to sum would first quantize its operands as well.
+            # This is a mechanism diagnostic, not the author's native pipeline.
+            reduced_mu = mu.to(torch.bfloat16)
+            reduced_second = second.to(torch.bfloat16)
+            retain("fixed_fp32_logp_bf16_reductions", lp, reduced_mu,
+                   reduced_second - reduced_mu.square(), target, normalize_fp32=True,
+                   product_dtype=torch.float32, reduction_dtype=torch.float32)
+            if include_cpu_float64:
+                # FP64 is used solely on CPU, including when logits originated
+                # on MPS. No FP64 tensor is allocated on MPS.
+                # Transfer first: a combined device/dtype conversion can ask
+                # MPS to perform the unsupported FP64 cast before transfer.
+                gold_block = block.detach().cpu().to(dtype=torch.float64)
+                gold_lp = torch.log_softmax(gold_block, dim=-1)
+                gold_p = gold_lp.exp()
+                gold_mu = (gold_p * gold_lp).sum(dim=-1)
+                gold_var = (gold_p * (gold_lp - gold_mu.unsqueeze(-1)).square()).sum(dim=-1)
+                gold_target = gold_lp.gather(-1, selected.cpu().unsqueeze(-1)).squeeze(-1)
+                retain("cpu_float64_centered", gold_lp, gold_mu, gold_var, gold_target)
+
+    compressed_bytes = len(zlib.compress(text.encode("utf-8"))) if text is not None else None
+    selected_count = max(1, int((k_percent / 100.0) * len(targets)))
+    result: dict[str, Any] = {}
+    for name in variants:
+        vectors = {key: torch.cat(parts) for key, parts in saved[name].items()}
+        supported = bool(vectors["support"].all().item())
+        scores = {key: None for key in ("loss", "mink", "minkpp", "zlib", "sum_logp")}
+        mink_indices: list[int] = []
+        minkpp_indices: list[int] = []
+        aggregate_valid = False
+        if supported:
+            worst_lp = torch.topk(vectors["logp"], selected_count, largest=False)
+            worst_z = torch.topk(vectors["z"], selected_count, largest=False)
+            sum_logp = float(vectors["logp"].sum().item())
+            scores = {
+                "loss": float(vectors["logp"].mean().item()),
+                "mink": float(worst_lp.values.mean().item()),
+                "minkpp": float(worst_z.values.mean().item()),
+                "sum_logp": sum_logp,
+                "zlib": sum_logp / compressed_bytes if compressed_bytes is not None else None,
+            }
+            mink_indices = worst_lp.indices.detach().cpu().tolist()
+            minkpp_indices = worst_z.indices.detach().cpu().tolist()
+            aggregate_valid = all(value is None or math.isfinite(value) for value in scores.values())
+            if not aggregate_valid:
+                scores = {key: None for key in scores}
+        result[name] = {
+            "status": "complete" if supported and aggregate_valid else "invalid_aggregate" if supported else "invalid_support",
+            "aggregate_valid": aggregate_valid,
+            "scores": scores,
+            "component_dtypes": component_dtypes[name],
+            "variance_formula": "centered" if name.endswith("centered") else "second_moment_minus_mean_squared",
+            "supported_target_count": int(vectors["support"].sum().item()),
+            "clamped_target_count": int(vectors["clamp_mask"].sum().item()),
+            "selected_token_count": selected_count,
+            "mink_selected_indices": mink_indices,
+            "minkpp_selected_indices": minkpp_indices,
+            "per_token": {
+                **{key: _vector_payload(vectors[key]) for key in ("logp", "mu", "variance", "sigma", "z")},
+                "clamp_mask": vectors["clamp_mask"].cpu().tolist(),
+                "support": vectors["support"].cpu().tolist(),
+            },
+        }
+    pandora_results = {}
+    pandora_selected_count = int((pandora_k_percent / 100.0) * len(targets)) if include_pandora else None
+    for name, components in pandora_saved.items():
+        vectors = {key: torch.cat(parts) for key, parts in components.items()}
+        supported = bool(vectors["support"].all().item())
+        score = feature = None
+        indices = []
+        status = "invalid_support" if not supported else "invalid_selection"
+        if supported and pandora_selected_count:
+            ordered, order = torch.sort(vectors["z"])
+            # Pinned MinK.reduce uses sum/count, rather than Tensor.mean().
+            reduced = ordered[:pandora_selected_count].sum() / pandora_selected_count
+            high_member = float(reduced.item())
+            if math.isfinite(high_member):
+                score, feature = high_member, -high_member
+                indices = order[:pandora_selected_count].detach().cpu().tolist()
+                status = "complete"
+            else:
+                status = "invalid_aggregate"
+        pandora_results[name] = {
+            "status": status,
+            "scores": {"pandora_minkxx": score, "pandora_minkxx_feature": feature},
+            "score_orientation": "pandora_minkxx higher_is_member; pandora_minkxx_feature lower_is_member",
+            "component_dtypes": pandora_dtypes[name],
+            "supported_target_count": int(vectors["support"].sum().item()),
+            "selected_token_count": pandora_selected_count,
+            "selected_indices": indices,
+            "per_token": {**{key: _vector_payload(vectors[key]) for key in ("logp", "mean", "std", "z")},
+                          "support": vectors["support"].cpu().tolist()},
+        }
+    return {
+        "variants": result,
+        "selection": {"k_percent": k_percent, "rounding": "max(1,floor(ratio*target_count))", "selected_count": selected_count},
+        "variance_floor": VARIANCE_FLOOR,
+        "denominator_epsilon": DENOMINATOR_EPSILON,
+        "statistics_chunk_tokens": chunk_tokens,
+        "forward_logit_dtype": str(logits.dtype),
+        "zlib_convention": "sum_scored_logp / zlib.compress(full_source_text_utf8, default_level=6)_bytes",
+        "compressed_source_text_bytes": compressed_bytes,
+        "pandora_comparators": pandora_results,
+        "pandora_convention": {
+            "enabled": include_pandora,
+            "source": PANDORA_SOURCE,
+            "normalization": "unweighted torch.std_mean(logp,dim=-1,correction=1); z=(target_logp-mean)/(std+1e-8)",
+            "variance_clamp": None,
+            "k_percent": pandora_k_percent if include_pandora else None,
+            "selected_count": pandora_selected_count,
+            "tail_rule": "floor(ratio*target_count), no minimum-one adjustment; zero selection is invalid",
+            "aggregation": "torch.sort(z).values[:selected_count].sum()/selected_count; original feature is its negative",
+            "scope": "Normalization/reduction comparators from the same engine forward logits, not whole-pipeline historical replication. The engine uses all-ones attention masks; Pandora defaults to input_ids>0 when callers supply no mask.",
+        },
+        "precision_interpretation": {
+            "author_native_vs_fp32": "Changes log-softmax, probability, moment and score arithmetic precision; not reduction-only isolation.",
+            "fp32_second_moment_vs_centered": "Same FP32 logp/probabilities/target support; changes variance formula.",
+            "fixed_fp32_logp_bf16_reductions": "Same FP32 logp/probabilities/products and FP32 moment reductions, followed by explicit BF16 moment-result casts, BF16 variance/sqrt, unchanged FP32 target logp and FP32 z. This isolates moment-result quantization and subsequent arithmetic, not internal kernel accumulation. Diagnostic, not author-native scoring; v1 used sum(dtype=BF16) and also cast operands before reduction, so its fourth variant is superseded.",
+        },
+    }
