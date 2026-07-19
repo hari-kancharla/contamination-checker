@@ -1,0 +1,112 @@
+{
+  "protocol_id": "real-data-selectivity-v1",
+  "status": "prospective_plan_after_source_inspection_not_blinded_preregistration",
+  "created_date": "2026-11-07",
+  "document": "docs/REAL_DATA_STUDY_PROTOCOL.md",
+  "source": {
+    "repository": "https://github.com/LuckyDaydreamer/OLMo-Detect",
+    "revision": "6eb88de34a09dea85c4b41deff4048e5a203e1b0",
+    "archive_sha256": "d7a157423bf537a343975db13bfddd9b271a7c24a9cb7ecc8f6b2342ca8d30ce",
+    "stage": "pretraining",
+    "primary_model_artifact": "OLMo2-1B-Instruct",
+    "raw_dev_records_per_arm_condition": 74,
+    "raw_test_records_per_arm_condition": 651,
+    "target_model_calls_phase_a": 0,
+    "upstream_program_execution": false
+  },
+  "namespace": "real-data-selectivity-v1/20261107",
+  "domains": ["dclm", "openwebmath", "pes2o", "starcoder"],
+  "source_group_fields": {
+    "dclm": "url",
+    "openwebmath": "url",
+    "pes2o": "id",
+    "starcoder": "max_stars_repo_name"
+  },
+  "case_design": {
+    "unit": "dataset_level_comparison",
+    "suspect_groups": 8,
+    "reference_groups": 8,
+    "primary_nonmember_case_upper_bound_before_quarantine": 36,
+    "quarantine_components_touching_dev": true,
+    "union_normalized_text_and_source_identity": true,
+    "exclude_unknown_code_repository_provenance": true,
+    "primary_records_reused_between_null_cases": false,
+    "mismatch_cycle": ["dclm", "openwebmath", "pes2o", "starcoder", "dclm"],
+    "mismatch_views_are_dependent": true,
+    "member_views_are_paired_with_null_references": true,
+    "no_text_manufacturing": true
+  },
+  "endpoint": {
+    "primary_score": "min_k_pp_score",
+    "higher_is_more_member_like": true,
+    "test": "frozen_current_one_sided_mann_whitney_greater",
+    "diagnostic_family": ["guided", "minkpp", "order"],
+    "missing_components_p_value": 1.0,
+    "family_multiplier": 3,
+    "rejection_alpha": 0.05,
+    "gated_output": "abstention",
+    "loss_comparator_score": "loss_score",
+    "loss_comparator_is_already_mean_log_likelihood": true,
+    "loss_comparator_not_combined_or_selected_with_primary": true,
+    "individual_screen_q": 0.1,
+    "individual_screen_minimum_p_value": "1/9",
+    "individual_screen_structurally_zero_power": true
+  },
+  "policy": {
+    "version": "comparison-v1",
+    "variant": "observable_saved_vector",
+    "min_calibration_examples": 4,
+    "canonicalize_scores": false,
+    "scored_token_identity_check": "unavailable",
+    "threshold_repair_after_test": false
+  },
+  "comparators": [
+    "no_eligibility_screen_after_common_quality_checks",
+    "current_length_only_gate",
+    "dev_fitted_text_origin_gate",
+    "transductive_origin_and_length_rankings_at_matched_coverage",
+    "analytical_random_matched_coverage",
+    "separate_supervised_dev_only_blind_text_membership_baseline"
+  ],
+  "origin_gate": {
+    "features": "fold_fitted_character_tfidf",
+    "ngram_range": [3, 5],
+    "lowercase": true,
+    "min_df": 1,
+    "max_features": 20000,
+    "sublinear_tf": true,
+    "normalization": "l2",
+    "classifier": "logistic_regression",
+    "C": 1.0,
+    "solver": "liblinear",
+    "max_iter": 1000,
+    "seed": 20261107,
+    "grouped_folds": 4,
+    "mismatch_statistic": "mean_within_fold_origin_auc",
+    "threshold_data": "dev_nonmember_raw_text_only",
+    "minimum_distinct_dev_blocks": 2,
+    "partitions_per_dev_block": 32,
+    "partition_views_are_not_independent_samples": true,
+    "threshold_quantile": 0.95,
+    "quantile_method": "higher",
+    "accept_when": "mismatch_statistic_le_threshold",
+    "threshold_guarantee": "none_development_fitted_heuristic"
+  },
+  "interpretation": {
+    "study_type": "bounded_falsification_and_feasibility",
+    "confirmatory_success_margin": null,
+    "low_fpr_validated": false,
+    "causal_exposure_evidence": false,
+    "novelty_established": false,
+    "full_local_model_policy_validated": false,
+    "same_records_other_models_or_conditions_are_independent": false
+  },
+  "required_before_outcome_evaluation": [
+    "independent_canonical_reader_and_hash_verified_joins",
+    "source_component_and_dev_overlap_audit",
+    "actual_case_assignment_and_exclusion_manifest",
+    "dev_fitted_origin_threshold_artifact",
+    "raw_score_orientation_and_auc_audit",
+    "implementation_dependency_and_protocol_hashes"
+  ]
+}
