@@ -1,0 +1,72 @@
+{
+  "protocol_id": "checkmia-weighted-vs-uniform-v1",
+  "date": "2026-11-07",
+  "status": "prospective_local_plan_after_primary_source_inspection_not_blinded_preregistration",
+  "question": "On exact released before/after-checkpoint packed tokens, what evidence does probability-weighted Min-K++ add over likelihood, and do normalization-definition or arithmetic variants materially change the result?",
+  "source": {
+    "paper": "https://aclanthology.org/2026.acl-short.30/",
+    "dataset": "jeffreygwang/pythia_dedupe_mia_0-97000_97000-98500",
+    "dataset_revision": "236fd818e7c877518d588eacc44658bdbf6b3a1b",
+    "target": "EleutherAI/pythia-1.4b-deduped",
+    "target_revision": "29376c0a610279f1d79507fc887c6170082f8839",
+    "target_checkpoint": "step97000",
+    "pandora_revision": "189a1f43fed580f002ebba3c894c8509f9da14b0",
+    "per_row_source_steps_used": false,
+    "original_training_stream_independently_replayed": false
+  },
+  "split": {
+    "namespace": "contamcheckr/checkmia-weighted-vs-uniform/20261107/v1",
+    "dev_per_arm": 1000,
+    "test_per_arm": 1000,
+    "selection": "Hash-sort component identity within official arm; first1000 dev, next1000 test; all assignments sealed before scoring.",
+    "grouping": ["exact_original_token_ids", "exact_forwarded_token_ids", "normalized_full_text"],
+    "cross_label_duplicate_components": "quarantine",
+    "within_label_components": "one score-independent representative",
+    "document_group_identity": "unavailable",
+    "semantic_duplicates_and_adjacent_chunk_dependence": "unresolved"
+  },
+  "scoring": {
+    "device": "mps",
+    "model_dtype": "float16",
+    "attention_implementation": "sdpa",
+    "batch_size": 1,
+    "model_scoring_subset": "All2000 test records plus1000 dev nonmembers. Dev members are used only by the text-only baseline, not target-model scoring.",
+    "statistics_chunk_tokens": 64,
+    "original_sequence_ids": 2049,
+    "forwarded_input": "original_ids[:-1]",
+    "targets": "original_ids[1:]",
+    "forwarded_tokens": 2048,
+    "scored_targets": 2048,
+    "decode_reencode": false,
+    "attention_mask": "all_ones; preserve original packed training context including token0 if present",
+    "k_percent": 10,
+    "weighted_variants": ["author_native", "fp32_second_moment", "fp32_centered", "fixed_fp32_logp_bf16_reductions"],
+    "pandora_uniform_comparators": ["native", "fp32"],
+    "pandora_comparator_scope": "Same-forward normalization/reduction only, not literal historical pipeline replication; pinned helper forwards2049 IDs and defaults attention mask to input_ids>0.",
+    "higher_member_orientation": true,
+    "per_token_vectors": true,
+    "cpu_float64_diagnostic": "First two dev nonmembers only; conditional on same returned model logits, not CPU model-forward parity.",
+    "invalid_support": "Preserve failed output and attempted denominator; stop and diagnose, no silent token or record dropping."
+  },
+  "analysis": {
+    "primary_methods": ["fp32_centered.loss", "fp32_centered.mink", "fp32_centered.minkpp"],
+    "primary_contrast": "AUC(fp32_centered.minkpp)-AUC(fp32_centered.loss)",
+    "secondary_contrasts": ["weighted_vs_uniform_vocab", "native_vs_fp32_normalization", "fp32_second_moment_vs_centered"],
+    "auc_uncertainty": "3000 paired within-arm bootstrap draws, seed20261107; conditional on fixed released bank, no family-generalization claim.",
+    "tail_threshold": "Dev nonmembers only: p=(1+number(dev_score>=test_score))/(1000+1); flag p<=0.01, ties included conservatively.",
+    "tail_outputs": ["test_nonmember_flags_and_denominator", "test_member_flags_and_denominator", "dev_calibration_count", "minimum_p_value", "failure_count"],
+    "blind_baseline": "Char3-5 TFIDF(max_features20000,sublinear_tf=True,lowercase=True)+LogisticRegression(C1,solverliblinear,class_weightbalanced,max_iter1000,seed20261107), fit dev only; no test tuning.",
+    "method_selection_after_test": false,
+    "test_threshold_tuning": false,
+    "scores_interim_used_for_design_changes": false,
+    "all_contrasts_exploratory": true,
+    "low_fpr_population_guarantee": false
+  },
+  "interpretation": {
+    "causal_exposure_effect_identified": false,
+    "benchmark_performance_inflation_measured": false,
+    "novelty_established": false,
+    "paper_reproduction": "New pinned-data implementation/definition comparison, not exact reproduction of historical CheckMIABench tables.",
+    "stop_or_reconsider": "If weighted Min-K++ has no useful advantage over likelihood, or differences are explained by arithmetic or text-only labels, remove superiority language and change the research question. Do not tune and re-use the same test bank as fresh validation."
+  }
+}
