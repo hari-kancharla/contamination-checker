@@ -285,3 +285,211 @@ def collect_data(snapshot, audit_dir):
                           "preseal_change_from_domain_prefixed_URLs": "No component/case impact on pinned data:903 canonical URLs and zero cross-domain URL collisions"}
     return Data(records, {r["row_id"]: r for r in records}, sorted(components, key=lambda c: c["component_id"]),
                 sorted(representatives, key=lambda r: (r["component_id"], r["split"], r["label"], r["condition"])), sources, identity_inventory)
+
+
+def ordered(representatives, domain):
+    return sorted(representatives, key=lambda r: (hkey(domain, r["component_id"]), r["component_id"]))
+
+
+def eligible_reps(data, *, split, label, condition, domain=None, unknown_code=False):
+    result = []
+    for row in data.representatives:
+        if row["split"] != split or row["label"] != label or row["condition"] != condition:
+            continue
+        if domain is not None and row["domain"] != domain:
+            continue
+        remaining = [r for r in row["exclusions"] if not (unknown_code and row["domain"] == "starcoder" and r == "unknown_source_provenance")]
+        if not remaining:
+            result.append(row)
+    return result
+
+
+def assignments(data, *, unknown_code=False):
+    cases, remainders = [], []
+    bank = "unknown_code_inclusive_sensitivity" if unknown_code else "primary"
+    null_by_domain = {}
+    for domain in DOMAINS:
+        reps = ordered(eligible_reps(data, split="test", label=0, condition="shared", domain=domain,
+                                     unknown_code=unknown_code), domain)
+        complete = len(reps) // 16
+        null_by_domain[domain] = []
+        for index in range(complete):
+            block = reps[index * 16:(index + 1) * 16]
+            case = {"case_id": f"{bank}/{domain}/null/{index}", "bank": bank, "domain": domain,
+                    "condition": "nonmember_null", "index": index,
+                    "suspect": [r["row_id"] for r in block[:8]], "reference": [r["row_id"] for r in block[8:]],
+                    "construction_status": "available", "published_suspect_label": 0,
+                    "published_reference_label": 0, "independence": "disjoint_primary_nonmember_components" if not unknown_code else "descriptive_provenance_sensitivity_dependent_on_primary"}
+            case["case_hash"] = hkey("case", case["case_id"])
+            cases.append(case)
+            null_by_domain[domain].append(case)
+        remainders.append({"bank": bank, "domain": domain, "eligible_nonmember_groups": len(reps),
+                           "complete_null_cases": complete, "unused_remainder": [r["row_id"] for r in reps[complete * 16:]]})
+    for domain in DOMAINS:
+        for condition in ("matched", "shifted"):
+            pool = ordered(eligible_reps(data, split="test", label=1, condition=condition, domain=domain,
+                                         unknown_code=unknown_code), domain)
+            used = set()
+            for null in null_by_domain[domain]:
+                reference_components = {data.by_id[r]["component_id"] for r in null["reference"]}
+                options = [r for r in pool if r["component_id"] not in used | reference_components]
+                selected = []
+                if domain == "starcoder":
+                    required = Counter(data.by_id[r]["subset"] for r in null["reference"])
+                    for row in options:
+                        if required[row["subset"]] > 0:
+                            selected.append(row)
+                            required[row["subset"]] -= 1
+                        if len(selected) == 8:
+                            break
+                else:
+                    selected = options[:8]
+                available = len(selected) == 8
+                if available:
+                    used.update(r["component_id"] for r in selected)
+                case_id = f"{bank}/{domain}/{condition}_member/{null['index']}"
+                cases.append({**null, "case_id": case_id, "case_hash": hkey("case", case_id),
+                              "condition": condition + "_member", "suspect": [r["row_id"] for r in selected] if available else [],
+                              "construction_status": "available" if available else "unavailable_member_groups_or_code_quota",
+                              "published_suspect_label": 1, "paired_null_case": null["case_id"],
+                              "independence": "paired_reference_reuse_and_correlated_member_conditions"})
+    for index, domain in enumerate(DOMAINS):
+        next_domain = DOMAINS[(index + 1) % len(DOMAINS)]
+        references = null_by_domain[next_domain]
+        for null in null_by_domain[domain]:
+            available = bool(references)
+            reference_case = references[null["index"] % len(references)] if available else None
+            case_id = f"{bank}/{domain}/mismatch/{null['index']}"
+            cases.append({**null, "case_id": case_id, "case_hash": hkey("case", case_id),
+                          "condition": "cross_domain_nonmember_stress", "reference_domain": next_domain,
+                          "reference": reference_case["reference"] if available else [],
+                          "construction_status": "available" if available else "unavailable_next_domain_block",
+                          "paired_null_case": null["case_id"],
+                          "reference_null_case": reference_case["case_id"] if available else None,
+                          "independence": "dependent_reused_nonmember_mismatch_stress_not_additional_null_trials"})
+    return cases, remainders
+
+
+def vectorizer(vocabulary=None):
+    return TfidfVectorizer(analyzer="char", ngram_range=(3, 5), lowercase=True, min_df=1,
+                           max_features=20000, sublinear_tf=True, norm="l2", vocabulary=vocabulary)
+
+
+def classifier(*, balanced=False):
+    return LogisticRegression(C=1, solver="liblinear", max_iter=1000, random_state=20261107,
+                              class_weight="balanced" if balanced else None)
+
+
+class Origin:
+    def __init__(self, data):
+        self.data = data
+        self.fit_counts = Counter()
+
+    def score(self, suspect, reference):
+        fold_map = {}
+        for origin, ids in ((1, suspect), (0, reference)):
+            ordered_ids = sorted(ids, key=lambda rid: (hkey("origin_fold", self.data.by_id[rid]["component_id"]), rid))
+            for index, rid in enumerate(ordered_ids):
+                fold_map[rid] = (origin, index % 4)
+        if len(fold_map) != 16:
+            return {"status": "unavailable_nonunique_or_incomplete_groups", "statistic": None, "folds": []}
+        results = []
+        for fold in range(4):
+            training = [rid for rid, (_, f) in fold_map.items() if f != fold]
+            test = [rid for rid, (_, f) in fold_map.items() if f == fold]
+            train_y = [fold_map[rid][0] for rid in training]
+            test_y = [fold_map[rid][0] for rid in test]
+            self.fit_counts["attempted"] += 1
+            try:
+                v = vectorizer()
+                matrix = v.fit_transform([self.data.by_id[rid]["text"] for rid in training])
+                model = classifier()
+                with warnings.catch_warnings():
+                    warnings.simplefilter("error", ConvergenceWarning)
+                    model.fit(matrix, train_y)
+                predictions = model.decision_function(v.transform([self.data.by_id[rid]["text"] for rid in test])).tolist()
+                status = "complete"
+                self.fit_counts["successful"] += 1
+            except ValueError as exc:
+                if "empty vocabulary" not in str(exc).lower():
+                    self.fit_counts["failed"] += 1
+                    return {"status": "unavailable_fit_error", "statistic": None, "error": str(exc), "folds": results}
+                predictions = [0.5] * len(test)
+                status = "empty_vocabulary_constant_half"
+                self.fit_counts["empty_vocabulary"] += 1
+            except Exception as exc:
+                self.fit_counts["failed"] += 1
+                return {"status": "unavailable_fit_error", "statistic": None,
+                        "error": f"{type(exc).__name__}: {exc}", "folds": results}
+            fold_auc = auc([p for p, y in zip(predictions, test_y) if y],
+                           [p for p, y in zip(predictions, test_y) if not y])
+            results.append({"fold": fold, "status": status, "auc": fold_auc,
+                            "training_row_ids": training, "heldout_row_ids": test,
+                            "heldout_origin_labels": test_y, "heldout_decision_scores": predictions})
+        return {"status": "complete", "statistic": sum(r["auc"] for r in results) / 4, "folds": results}
+
+
+def fit_development(data):
+    origin = Origin(data)
+    partitions, blocks, remainders = [], [], []
+    for domain in DOMAINS:
+        reps = ordered(eligible_reps(data, split="dev", label=0, condition="shared", domain=domain), domain)
+        n_blocks = len(reps) // 16
+        remainders.append({"domain": domain, "eligible_groups": len(reps), "complete_blocks": n_blocks,
+                           "unused_representatives": [r["row_id"] for r in reps[n_blocks * 16:]]})
+        for block_index in range(n_blocks):
+            block = reps[block_index * 16:(block_index + 1) * 16]
+            identifiers = [r["row_id"] for r in block]
+            used, attempts, successes = set(), 0, 0
+            while successes < 32:
+                if attempts >= 10000:
+                    raise ValueError("Could not construct32 unique balanced dev partitions")
+                permutation = sorted(identifiers, key=lambda rid: (hkey("dev_partition", domain, block_index, attempts,
+                                                                        data.by_id[rid]["component_id"]), rid))
+                signature = min(tuple(sorted(permutation[:8])), tuple(sorted(permutation[8:])))
+                attempt = attempts
+                attempts += 1
+                if signature in used:
+                    continue
+                used.add(signature)
+                record = {"domain": domain, "block": block_index, "partition_index": successes,
+                          "attempt_index": attempt, "suspect": permutation[:8], "reference": permutation[8:],
+                          **origin.score(permutation[:8], permutation[8:])}
+                partitions.append(record)
+                successes += 1
+            blocks.append({"domain": domain, "block": block_index, "row_ids": identifiers,
+                           "unique_partitions": successes, "attempts": attempts, "duplicate_or_complement_skips": attempts - successes})
+    observed = [p["statistic"] for p in partitions if p["status"] == "complete"]
+    operational = len(blocks) >= 2 and len(observed) == len(partitions)
+    threshold = float(np.quantile(observed, .95, method="higher")) if operational else None
+    calibration = {"threshold": threshold, "status": "development_fitted_heuristic" if operational else "uncalibrated",
+                   "distinct_blocks": len(blocks), "partition_views": len(partitions),
+                   "complete_partition_views": len(observed), "guarantee": "none; views share underlying blocks",
+                   "quantile": .95, "quantile_method": "higher", "blocks": blocks,
+                   "remainders": remainders, "fit_counts": dict(origin.fit_counts)}
+
+    training = eligible_reps(data, split="dev", label=0, condition="shared") + eligible_reps(data, split="dev", label=1, condition="matched")
+    training.sort(key=lambda r: r["row_id"])
+    v, model = vectorizer(), classifier(balanced=True)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", ConvergenceWarning)
+        model.fit(v.fit_transform([data.by_id[r["row_id"]]["text"] for r in training]), [r["label"] for r in training])
+    blind = {"status": "dev_fit_complete", "training": training, "classes": model.classes_.tolist(),
+             "vocabulary": {k: int(i) for k, i in v.vocabulary_.items()}, "idf": v.idf_.tolist(),
+             "coefficients": model.coef_.tolist(), "intercept": model.intercept_.tolist(),
+             "class_weight": "balanced", "feature_count": len(v.vocabulary_),
+             "training_counts": dict(Counter(f"{r['domain']}:{r['label']}" for r in training)),
+             "test_results_computed": False}
+    reconstructed = blind_decision(blind, [data.by_id[r["row_id"]]["text"] for r in training])
+    expected = model.decision_function(v.transform([data.by_id[r["row_id"]]["text"] for r in training]))
+    if not np.allclose(reconstructed, expected, rtol=0, atol=1e-12):
+        raise ValueError("Blind model JSON roundtrip failed on development texts")
+    blind["development_parameter_roundtrip_max_abs_error"] = float(np.max(np.abs(reconstructed - expected)))
+    return calibration, partitions, blind
+
+
+def blind_decision(model, texts):
+    v = vectorizer(vocabulary=model["vocabulary"])
+    v.idf_ = np.asarray(model["idf"], dtype=float)
+    weights = np.asarray(model["coefficients"][0], dtype=float)
+    return np.asarray(v.transform(texts) @ weights + float(model["intercept"][0])).reshape(-1)
