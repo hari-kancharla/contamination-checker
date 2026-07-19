@@ -493,3 +493,284 @@ def blind_decision(model, texts):
     v.idf_ = np.asarray(model["idf"], dtype=float)
     weights = np.asarray(model["coefficients"][0], dtype=float)
     return np.asarray(v.transform(texts) @ weights + float(model["intercept"][0])).reshape(-1)
+
+
+def source_hashes(data, protocol):
+    result = dict(data.sources)
+    paths = [PROJECT / name for name in IMPLEMENTATIONS] + [Path(__file__), protocol,
+             PROJECT / "docs/REAL_DATA_STUDY_PROTOCOL.md"]
+    for path in paths:
+        result[str(path.resolve())] = hash_file(path)
+    return result
+
+
+def verify_sources(sources):
+    changed = [path for path, expected in sources.items() if not Path(path).is_file() or hash_file(Path(path)) != expected]
+    if changed:
+        raise ValueError(f"Frozen source bytes changed: {changed}")
+
+
+def seal(args):
+    args.output.mkdir(parents=True, exist_ok=False)
+    started = time.perf_counter()
+    protocol = read_json(args.protocol)
+    if protocol["namespace"] != NAMESPACE or protocol["policy"]["version"] != POLICY_VERSION:
+        raise ValueError("Unexpected protocol namespace or policy version")
+    data = collect_data(args.snapshot, args.audit_dir)
+    sources = source_hashes(data, args.protocol)
+    cases, remainder = assignments(data)
+    sensitivity, sensitivity_remainder = assignments(data, unknown_code=True)
+    # The sensitivity is restricted to code; other domains' duplicate views
+    # provide no additional information and are not emitted as extra trials.
+    sensitivity = [c for c in sensitivity if c["domain"] == "starcoder"]
+    calibration, partitions, blind = fit_development(data)
+    verify_sources(sources)
+    (args.output / "frozen_source").mkdir()
+    for relative in IMPLEMENTATIONS:
+        shutil.copyfile(PROJECT / relative, args.output / "frozen_source" / Path(relative).name)
+    shutil.copyfile(Path(__file__), args.output / "frozen_source/real_selectivity_study.py")
+    shutil.copyfile(args.protocol, args.output / "frozen_source/protocol.json")
+    shutil.copyfile(PROJECT / "docs/REAL_DATA_STUDY_PROTOCOL.md", args.output / "frozen_source/PROTOCOL.md")
+    write_json(args.output / "components.json", data.components)
+    write_json(args.output / "representatives.json", data.representatives)
+    write_jsonl(args.output / "case_assignments.jsonl", cases + sensitivity)
+    write_json(args.output / "remainders.json", remainder + [r for r in sensitivity_remainder if r["domain"] == "starcoder"])
+    write_json(args.output / "origin_calibration.json", calibration)
+    write_jsonl(args.output / "origin_dev_partitions.jsonl", partitions)
+    with gzip.open(args.output / "blind_dev_model.json.gz", "wb") as stream:
+        stream.write(encoded(blind) + b"\n")
+    raw_snapshot = [{k: v for k, v in r.items() if k not in ("text", "scores")} for r in data.records]
+    write_jsonl(args.output / "record_provenance.jsonl", raw_snapshot)
+    artifacts = {str(p.relative_to(args.output)): hash_file(p) for p in sorted(args.output.rglob("*")) if p.is_file()}
+    manifest = {"protocol_id": protocol["protocol_id"], "status": "sealed_before_heldout_case_outcomes",
+                "created_utc": datetime.now(timezone.utc).isoformat(), "namespace": NAMESPACE,
+                "snapshot": str(args.snapshot.resolve()), "audit_dir": str(args.audit_dir.resolve()),
+                "protocol_path": str(args.protocol.resolve()), "implementation_resolutions": RESOLUTIONS,
+                "sources": sources, "artifacts": artifacts,
+                "versions": {n: importlib.metadata.version(n) for n in ("numpy", "scipy", "scikit-learn", "threadpoolctl")},
+                "python": platform.python_version(), "models": list(MODELS), "primary_model": MODELS[0],
+                "target_model_calls": 0, "upstream_code_executed": False, "synthetic_text_records": 0,
+                "score_signs": {"LOSS": "mean_log_likelihood_higher_is_member", "MinK++": "unchanged_higher_is_member", "MinK": "exploratory_unchanged_higher_is_member"},
+                "component_count": len(data.components), "raw_records": len(data.records),
+                "source_identity_inventory": data.source_identity_inventory,
+                "base_exclusion_counts": dict(Counter(reason for c in data.components for reason in c["base_exclusions"])),
+                "test_components_touching_dev": sum(c["touches_dev"] and any(data.by_id[r]["split"] == "test" for r in c["row_ids"]) for c in data.components),
+                "case_templates": dict(Counter(f"{c['bank']}:{c['condition']}:{c['construction_status']}" for c in cases + sensitivity)),
+                "origin_threshold": calibration["threshold"], "origin_distinct_dev_blocks": calibration["distinct_blocks"],
+                "preprocessing_and_dev_fit_seconds": time.perf_counter() - started,
+                "policy_min_calibration_examples": 4, "missing_effective_scoring_identity": True,
+                "outcomes_computed": False}
+    write_json(args.output / "sealed_manifest.json", manifest)
+    write_json(args.output / "seal_receipt.json", {"sealed_manifest_sha256": hash_file(args.output / "sealed_manifest.json"),
+                                                  "outcomes_computed": False})
+    print(json.dumps({k: manifest[k] for k in ("status", "component_count", "raw_records", "base_exclusion_counts",
+                                              "test_components_touching_dev", "case_templates", "origin_threshold",
+                                              "origin_distinct_dev_blocks", "preprocessing_and_dev_fit_seconds")}, indent=2), flush=True)
+
+
+def common_quality(case, data, model):
+    problems = []
+    if case["construction_status"] != "available":
+        problems.append(case["construction_status"])
+    if len(case["suspect"]) != 8 or len(case["reference"]) != 8:
+        problems.append("not_eight_records_per_side")
+    ids = case["suspect"] + case["reference"]
+    if len({data.by_id[r]["component_id"] for r in ids}) != len(ids):
+        problems.append("reused_component_within_case")
+    for rid in ids:
+        row = data.by_id[rid]
+        if row["split"] != "test":
+            problems.append("non_test_record")
+        for method in ("LOSS", "MinK++"):
+            score = row["scores"][model].get(method)
+            if score is None or score["score"] is None or not math.isfinite(score["score"]):
+                problems.append(f"missing_finite_{method}:{rid}")
+            elif type(score["token_count"]) is not int or score["token_count"] <= 0:
+                problems.append(f"invalid_token_count_{method}:{rid}")
+    return {"status": "complete" if not problems else "unavailable", "reasons": sorted(set(problems))}
+
+
+def endpoint(positive, negative, *, diagnostic_slot="minkpp"):
+    test = mann_whitney_u_test(positive, negative, alternative="greater")
+    adjusted = combine_diagnostic_pvalues({diagnostic_slot: float(test["p_value"]), "guided": None, "order": None})
+    direct = auc(positive, negative)
+    if abs(test["auc"] - direct) > 1e-12:
+        raise ValueError("Frozen statistical AUC disagrees with direct pair counting")
+    return {"raw_auc": direct, "unadjusted_p": float(test["p_value"]),
+            "adjusted_p": adjusted["p_value"], "mann_whitney_method": test["method"],
+            "mann_whitney_label_assignments": test["label_assignments"],
+            "family_size": adjusted["family_size"], "missing_components_p": 1.0,
+            "ungated_diagnostic_rejection": adjusted["p_value"] < .05,
+            "interpretation": "Conditional score-distribution diagnostic, not calibrated contamination evidence"}
+
+
+def analyze_case(case, data, model, origin_result, threshold, fingerprint):
+    result = {**case, "model": model, "common_quality": common_quality(case, data, model),
+              "missing_checks": ["effective_scoring_token_identity_unavailable"],
+              "origin_mismatch": origin_result,
+              "diagnostics": {}, "gates": {}, "checks": {}, "vectors": []}
+    gate_names = ("no_gate", "length_only", "origin_threshold", "full_policy", "ablate_numeric_shift",
+                  "ablate_length_shift", "ablate_heterogeneous_control")
+    if result["common_quality"]["status"] != "complete":
+        result["gates"] = {g: {"action": "unavailable", "reported_adjusted_p": None,
+                                "diagnostic_rejection": False, "reason": "common_quality_unavailable"} for g in gate_names}
+        return result
+    suspect = [data.by_id[r] for r in case["suspect"]]
+    reference = [data.by_id[r] for r in case["reference"]]
+    s_lengths = [r["scores"][model]["MinK++"]["token_count"] for r in suspect]
+    r_lengths = [r["scores"][model]["MinK++"]["token_count"] for r in reference]
+    shift = domain_shift_check(s_lengths, r_lengths)
+    null = control_null_check([r["scores"][model]["MinK++"]["score"] for r in reference], min_examples=4)
+    validity = likelihood_comparison_validity(
+        [r["text"] for r in suspect], [r["text"] for r in reference],
+        benchmark_scored=8, control_scored=8, min_examples=4,
+        domain_shift=shift, fingerprint=fingerprint, control_null=null,
+        benchmark_scoring_ids=None, control_scoring_ids=None,
+    )
+    if fingerprint is None or fingerprint.get("digit_mann_whitney_p_value") is None:
+        result["missing_checks"].append("per_text_numeric_fingerprint_insufficient_finite_numeric_texts")
+    if null is None:
+        result["missing_checks"].append("control_self_check_unavailable")
+    result["checks"] = {"policy": validity, "length_shift": shift, "numeric_fingerprint": fingerprint,
+                         "control_self_check": null, "scored_input_identity": "unavailable"}
+    for method in ("MinK++", "LOSS"):
+        result["diagnostics"][method] = endpoint([r["scores"][model][method]["score"] for r in suspect],
+                                                  [r["scores"][model][method]["score"] for r in reference])
+    # Entire exploratory method list: MinK AUC only; never selected/combined.
+    exploratory = [r["scores"][model].get("MinK") for r in suspect + reference]
+    if all(v is not None and v["score"] is not None and math.isfinite(v["score"]) for v in exploratory):
+        result["diagnostics"]["MinK_exploratory"] = {"raw_auc": auc(
+            [v["score"] for v in exploratory[:8]], [v["score"] for v in exploratory[8:]]),
+            "status": "descriptive_only_no_test_or_selection"}
+    else:
+        result["diagnostics"]["MinK_exploratory"] = {"raw_auc": None, "status": "unavailable_exploratory_score"}
+    ratio = shift["benchmark_median_tokens"] / max(shift["control_median_tokens"], 1.0)
+    result["absolute_log_median_length_ratio"] = abs(math.log(ratio))
+    reason_codes = {r["code"] for r in validity["reasons"]}
+    decisions = {"no_gate": True, "length_only": "length_shift" not in reason_codes,
+                 "full_policy": validity["eligible"],
+                 "origin_threshold": None if threshold is None or origin_result["statistic"] is None else
+                 origin_result["statistic"] <= threshold}
+    for code in ("numeric_shift", "length_shift", "heterogeneous_control"):
+        decisions["ablate_" + code] = not (reason_codes - {code})
+    p = result["diagnostics"]["MinK++"]["adjusted_p"]
+    for gate, accepts in decisions.items():
+        result["gates"][gate] = {"action": "unavailable" if accepts is None else "accepted" if accepts else "abstained",
+                                "reported_adjusted_p": p if accepts else None,
+                                "diagnostic_rejection": bool(accepts and p < .05),
+                                "reason": "origin_uncalibrated_or_fit_failed" if accepts is None else None}
+    result["stored_scored_target_footprint"] = {"suspect": sum(s_lengths), "reference": sum(r_lengths),
+                                               "total_within_case": sum(s_lengths) + sum(r_lengths),
+                                               "target_model_calls_for_this_study": 0}
+    result["individual_screen"] = {"q": .1, "control_count": 8, "minimum_conformal_p": 1 / 9,
+                                    "flags": 0, "reason": "structurally_zero_power_at_this_control_count_not_empirical_safety"}
+    for side, rows in (("suspect", suspect), ("reference", reference)):
+        for row in rows:
+            result["vectors"].append({"side": side, "row_id": row["row_id"], "component_id": row["component_id"],
+                                      "domain": row["domain"], "subset": row["subset"], "official_label": row["label"],
+                                      "raw_text_sha256": row["raw_text_sha256"], "score_text_hash": row["text_hash"],
+                                      "scores": row["scores"][model]})
+    return result
+
+
+def blind_evaluate(data, model):
+    results = []
+    all_rows = []
+    for condition in ("matched", "shifted"):
+        rows = eligible_reps(data, split="test", label=0, condition="shared") + eligible_reps(data, split="test", label=1, condition=condition)
+        values = blind_decision(model, [data.by_id[r["row_id"]]["text"] for r in rows]).tolist()
+        observations = [{"condition": condition, "row_id": r["row_id"], "component_id": r["component_id"],
+                         "domain": r["domain"], "label": r["label"], "decision_score": value}
+                        for r, value in zip(rows, values)]
+        all_rows.extend(observations)
+        for domain in ("ALL", *DOMAINS):
+            selected = [r for r in observations if domain == "ALL" or r["domain"] == domain]
+            positive = [r["decision_score"] for r in selected if r["label"]]
+            negative = [r["decision_score"] for r in selected if not r["label"]]
+            results.append({"condition": condition, "domain": domain, "member_records": len(positive),
+                            "nonmember_records": len(negative), "auc": auc(positive, negative),
+                            "interpretation": "Dev-supervised text-only baseline; same shared nonmembers across member conditions; no target-model inference"})
+    return results, all_rows
+
+
+def proportion(numerator, denominator):
+    return numerator / denominator if denominator else None
+
+
+def summarize(cases):
+    grouped = defaultdict(list)
+    for case in cases:
+        key = (case["model"], case["bank"], case["condition"])
+        grouped[key + (case["domain"],)].append(case)
+        grouped[key + ("ALL",)].append(case)
+    summaries, paired = [], []
+    for (model, bank, condition, domain), rows in sorted(grouped.items()):
+        complete = [r for r in rows if r["common_quality"]["status"] == "complete"]
+        n = len(complete)
+        ungated = sum(r["diagnostics"]["MinK++"]["ungated_diagnostic_rejection"] for r in complete)
+        full_ids = {r["case_id"] for r in complete if r["gates"]["full_policy"]["action"] == "accepted"}
+        k = len(full_ids)
+        header = {"model": model, "bank": bank, "condition": condition, "domain": domain,
+                  "attempted_templates": len(rows), "formed_cases": sum(r["construction_status"] == "available" for r in rows),
+                  "common_quality_complete": n, "common_quality_unavailable": len(rows) - n,
+                  "sampling_inference": "finite_bank_descriptive_no_binomial_or_independence_assumption"}
+        for gate in rows[0]["gates"]:
+            accepted = [r for r in rows if r["gates"][gate]["action"] == "accepted"]
+            flagged = [r for r in accepted if r["gates"][gate]["diagnostic_rejection"]]
+            summaries.append({**header, "gate": gate, "accepted": len(accepted), "diagnostic_rejections": len(flagged),
+                              "abstained": sum(r["gates"][gate]["action"] == "abstained" for r in rows),
+                              "gate_unavailable": sum(r["gates"][gate]["action"] == "unavailable" for r in rows),
+                              "coverage_per_attempted": proportion(len(accepted), len(rows)),
+                              "coverage_per_complete": proportion(len(accepted), n),
+                              "rejections_per_attempted": proportion(len(flagged), len(rows)),
+                              "rejections_per_accepted": proportion(len(flagged), len(accepted)),
+                              "accepted_case_ids": [r["case_id"] for r in accepted],
+                              "rejected_case_ids": [r["case_id"] for r in flagged]})
+        loss_flags = [r for r in complete if r["diagnostics"]["LOSS"]["ungated_diagnostic_rejection"]]
+        summaries.append({**header, "gate": "fixed_LOSS_ungated_separate_comparator", "accepted": n,
+                          "diagnostic_rejections": len(loss_flags), "abstained": 0, "gate_unavailable": len(rows) - n,
+                          "coverage_per_attempted": proportion(n, len(rows)), "coverage_per_complete": 1.0 if n else None,
+                          "rejections_per_attempted": proportion(len(loss_flags), len(rows)),
+                          "rejections_per_accepted": proportion(len(loss_flags), n),
+                          "rejected_case_ids": [r["case_id"] for r in loss_flags]})
+        for name, value in (("origin", lambda r: r["origin_mismatch"]["statistic"]),
+                            ("length", lambda r: r.get("absolute_log_median_length_ratio"))):
+            supported = all(value(r) is not None for r in complete)
+            chosen = sorted(complete, key=lambda r: (value(r), r["case_hash"]))[:k] if supported else []
+            chosen_ids = {r["case_id"] for r in chosen}
+            flags = [r for r in chosen if r["diagnostics"]["MinK++"]["ungated_diagnostic_rejection"]]
+            summaries.append({**header, "gate": f"transductive_{name}_matched_coverage",
+                              "status": "descriptive" if supported else "unavailable_ranking_statistic",
+                              "accepted": len(chosen) if supported else None,
+                              "diagnostic_rejections": len(flags) if supported else None,
+                              "coverage_per_complete": proportion(k, n) if supported else None,
+                              "rejections_per_attempted": proportion(len(flags), len(rows)) if supported else None,
+                              "rejections_per_accepted": proportion(len(flags), k) if supported else None,
+                              "accepted_case_ids": sorted(chosen_ids), "rejected_case_ids": [r["case_id"] for r in flags]})
+            full_flags = {r["case_id"] for r in complete if r["gates"]["full_policy"]["diagnostic_rejection"]}
+            paired.append({**header, "comparison": "full_policy_minus_transductive_" + name,
+                           "accepted_count_difference": k - len(chosen) if supported else None,
+                           "diagnostic_rejection_difference": len(full_flags) - len(flags) if supported else None,
+                           "full_only_accepted": sorted(full_ids - chosen_ids), "comparator_only_accepted": sorted(chosen_ids - full_ids)})
+        pmf = None
+        if n and k:
+            pmf = [{"retained_rejections": x, "probability": math.comb(ungated, x) * math.comb(n - ungated, k - x) / math.comb(n, k)}
+                   for x in range(max(0, k - (n - ungated)), min(k, ungated) + 1)]
+        summaries.append({**header, "gate": "analytical_random_matched_coverage", "accepted": k if n and k else None,
+                          "expected_diagnostic_rejections": k * ungated / n if n and k else None,
+                          "ungated_diagnostic_rejections": ungated,
+                          "hypergeometric_distribution": pmf,
+                          "status": "analytical_uniform_selection" if n and k else "unavailable_zero_complete_or_accepted_count",
+                          "interpretation": "Expectation over selecting k of N fixed complete cases; not new evidence or an independence claim"})
+        for gate in ("no_gate", "length_only", "origin_threshold"):
+            full_flags = {r["case_id"] for r in complete if r["gates"]["full_policy"]["diagnostic_rejection"]}
+            other_flags = {r["case_id"] for r in complete if r["gates"][gate]["diagnostic_rejection"]}
+            other_accepted = {r["case_id"] for r in complete if r["gates"][gate]["action"] == "accepted"}
+            paired.append({**header, "comparison": "full_policy_minus_" + gate,
+                           "accepted_count_difference": k - len(other_accepted),
+                           "diagnostic_rejection_difference": len(full_flags) - len(other_flags),
+                           "full_only_rejections": sorted(full_flags - other_flags),
+                           "comparator_only_rejections": sorted(other_flags - full_flags),
+                           "full_only_accepted": sorted(full_ids - other_accepted),
+                           "comparator_only_accepted": sorted(other_accepted - full_ids)})
+    return summaries, paired
