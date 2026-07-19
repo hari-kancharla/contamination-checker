@@ -127,3 +127,76 @@ def linear_interval(values: Any) -> list[float]:
         right = min(left + 1, len(ordered) - 1)
         result.append(float(ordered[left] + (ordered[right] - ordered[left]) * remainder / 40))
     return result
+
+
+def bootstrap_ranks(vectors: dict[str, tuple[np.ndarray, np.ndarray]]) -> dict[str, np.ndarray]:
+    random = np.random.default_rng(SEED)
+    result = {name: np.empty(DRAWS) for name in vectors}
+    require(all(len(a) == len(b) == 1000 for a, b in vectors.values()), "Bootstrap arms must remain 1,000/1,000.")
+    for draw in range(DRAWS):
+        # Exactly the same paired indices, but no bincount/grouped-score AUC.
+        positive_indices = random.integers(0, 1000, size=1000)
+        negative_indices = random.integers(0, 1000, size=1000)
+        for name, (positive, negative) in vectors.items():
+            result[name][draw] = rank_auc(positive[positive_indices], negative[negative_indices])
+        if (draw + 1) % 500 == 0:
+            print(json.dumps({"stage": "independent_rank_bootstrap", "draws_completed": draw + 1}), flush=True)
+    return result
+
+
+def blind_replay(source: list[dict[str, Any]], parameters: dict[str, Any], stored: dict[str, float],
+                 *, refit: bool) -> dict[str, Any]:
+    from sklearn.exceptions import ConvergenceWarning
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    from sklearn.linear_model import LogisticRegression
+    from threadpoolctl import threadpool_limits
+
+    train = [row for row in source if row["study_split"] == "dev"]
+    test = sorted((row for row in source if row["study_split"] == "test"), key=lambda row: row["id"])
+    require(parameters["training_ids"] == [row["id"] for row in train], "Blind training IDs/order are not sealed dev only.")
+    require(len(train) == 2000 and len(test) == 2000 and
+            Counter(row["official_label"] for row in train) == {0: 1000, 1: 1000}, "Wrong blind training/test cohort.")
+    require(not set(parameters["training_ids"]) & {row["id"] for row in test}, "Blind train/test overlap.")
+    require(parameters["classes"] == [0, 1], "Blind score orientation/classes changed.")
+    require(parameters["features"] == "char3-5 TFIDF20k sublinear_tf L2 lowercase; no metadata"
+            and parameters["classification"] == "C1 liblinear balanced max_iter1000 seed20261107; dev only, no tuning",
+            "Blind declared hyperparameters changed.")
+    vocabulary = parameters["vocabulary"]
+    require(0 < len(vocabulary) <= 20000 and sorted(vocabulary.values()) == list(range(len(vocabulary))),
+            "Invalid blind feature mapping.")
+    saved_idf = np.asarray(parameters["idf"], dtype=float)
+    coef = np.asarray(parameters["coef"], dtype=float)
+    intercept = np.asarray(parameters["intercept"], dtype=float)
+    require(saved_idf.shape == (len(vocabulary),) and coef.shape == (1, len(vocabulary))
+            and intercept.shape == (1,) and all(np.isfinite(x).all() for x in (saved_idf, coef, intercept)),
+            "Invalid blind parameters.")
+    settings = dict(analyzer="char", ngram_range=(3, 5), lowercase=True, min_df=1,
+                    max_features=20000, sublinear_tf=True, norm="l2")
+    train_texts, test_texts = [row["text"] for row in train], [row["text"] for row in test]
+    with threadpool_limits(limits=1), warnings.catch_warnings():
+        warnings.simplefilter("error", ConvergenceWarning)
+        fixed = TfidfVectorizer(vocabulary=vocabulary, **settings)
+        fixed.fit(train_texts)
+        idf_difference = close_array(fixed.idf_, saved_idf, "Blind IDF reconstructed from dev text")
+        fixed.idf_ = saved_idf
+        prediction = expit(np.asarray(fixed.transform(test_texts) @ coef[0]).ravel() + intercept[0])
+        expected = np.asarray([stored[row["id"]] for row in test])
+        prediction_difference = close_array(prediction, expected, "Blind prediction replay from saved JSON parameters")
+        result = {"training_records": 2000, "test_records": 2000, "training_ids_dev_only": True,
+                  "saved_parameter_prediction_max_absolute_difference": prediction_difference,
+                  "dev_reconstructed_idf_max_absolute_difference": idf_difference,
+                  "independent_refit_requested": refit}
+        if refit:
+            fresh = TfidfVectorizer(**settings)
+            matrix = fresh.fit_transform(train_texts)
+            require(fresh.vocabulary_ == vocabulary, "Dev-only refit feature selection differs.")
+            fresh_idf_difference = close_array(fresh.idf_, saved_idf, "Independent blind refit IDF")
+            classifier = LogisticRegression(C=1., solver="liblinear", class_weight="balanced", max_iter=1000,
+                                            random_state=SEED)
+            classifier.fit(matrix, [row["official_label"] for row in train])
+            predicted = classifier.predict_proba(fresh.transform(test_texts))[:, 1]
+            result.update(independent_refit_prediction_max_absolute_difference=close_array(
+                predicted, expected, "Independent dev-only blind refit predictions"),
+                independent_refit_idf_max_absolute_difference=fresh_idf_difference,
+                independent_refit_coefficient_max_absolute_difference=float(np.max(np.abs(classifier.coef_ - coef))))
+    return result
