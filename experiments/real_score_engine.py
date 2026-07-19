@@ -168,3 +168,78 @@ def prepare_checkmiabench_tokens(
         "final_eos_target_removed": False,
         "other_special_targets": "retained as original training-sequence tokens",
     }, original_token_ids=original)
+
+
+def load_local_checkpoint(
+    path: str | Path, *, device: str = "mps", model_dtype: str = "bfloat16",
+    attention_implementation: str = "sdpa", seed: int = 42,
+) -> LocalCheckpoint:
+    """Load an existing local checkpoint; downloads and custom code are disabled."""
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    checkpoint = Path(path).expanduser().resolve()
+    if not checkpoint.is_dir() or not (checkpoint / "config.json").is_file():
+        raise ValueError("Model path must be an existing local checkpoint with config.json.")
+    dtypes = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
+    if model_dtype not in dtypes or device not in {"cpu", "mps", "cuda"}:
+        raise ValueError("Choose an explicit supported device and model dtype.")
+    if device == "mps" and not torch.backends.mps.is_available():
+        raise ValueError("MPS is unavailable; select CPU explicitly for a separate recorded run.")
+    if device == "cuda" and not torch.cuda.is_available():
+        raise ValueError("CUDA is unavailable.")
+    torch.manual_seed(seed)
+    tokenizer = AutoTokenizer.from_pretrained(str(checkpoint), local_files_only=True,
+                                             trust_remote_code=False)
+    model = AutoModelForCausalLM.from_pretrained(
+        str(checkpoint), local_files_only=True, trust_remote_code=False,
+        dtype=dtypes[model_dtype], attn_implementation=attention_implementation,
+    )
+    model.to(torch.device(device))
+    model.eval()
+    model.config.use_cache = False
+    context_limit = getattr(model.config, "max_position_embeddings", None)
+    if not isinstance(context_limit, int) or context_limit < 2:
+        raise ValueError("Model must expose a finite max_position_embeddings context limit.")
+    from contamcheckr.hashing import local_model_signature, tokenizer_fingerprint
+    identity = {
+        "local_checkpoint": str(checkpoint),
+        "model_dtype": str(next(model.parameters()).dtype),
+        "device": str(next(model.parameters()).device),
+        "model_type": getattr(model.config, "model_type", None),
+        "parameter_count": sum(parameter.numel() for parameter in model.parameters()),
+        "context_limit": context_limit,
+        "requested_attention_implementation": attention_implementation,
+        "resolved_attention_implementation": getattr(model.config, "_attn_implementation", None),
+        "tokenizer_fingerprint": tokenizer_fingerprint(tokenizer),
+        "local_metadata_signature": local_model_signature(str(checkpoint)),
+        "weight_content_sha256": None,
+        "weight_identity_note": "Attach the separately verified download/content-hash receipt; metadata alone is not weight identity.",
+        "use_cache": False,
+        "seed": seed,
+    }
+    return LocalCheckpoint(model, tokenizer, next(model.parameters()).device, context_limit, identity)
+
+
+def _sync(device: Any) -> None:
+    import torch
+    if device.type == "mps":
+        torch.mps.synchronize()
+    elif device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+
+def _memory_snapshot(device: Any) -> dict[str, Any]:
+    import torch
+    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    result = {"process_peak_rss_bytes": peak if sys.platform == "darwin" else peak * 1024}
+    if device.type == "mps":
+        result.update({name: getattr(torch.mps, name)() for name in (
+            "current_allocated_memory", "driver_allocated_memory", "recommended_max_memory",
+        )})
+    return result
+
+
+def _vector_payload(tensor: Any) -> list[Any]:
+    """Keep JSON standard: nonfinite observations are explicit nulls plus support masks."""
+    values = tensor.detach().cpu().tolist()
+    return [float(value) if math.isfinite(float(value)) else None for value in values]
