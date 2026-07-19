@@ -468,3 +468,163 @@ def score_logits_variants(
             "fixed_fp32_logp_bf16_reductions": "Same FP32 logp/probabilities/products and FP32 moment reductions, followed by explicit BF16 moment-result casts, BF16 variance/sqrt, unchanged FP32 target logp and FP32 z. This isolates moment-result quantization and subsequent arithmetic, not internal kernel accumulation. Diagnostic, not author-native scoring; v1 used sum(dtype=BF16) and also cast operands before reduction, so its fourth variant is superseded.",
         },
     }
+
+
+def score_prepared(
+    checkpoint: LocalCheckpoint, prepared: PreparedInput, *, chunk_tokens: int = 64,
+    k_percent: float = 20.0, include_cpu_float64: bool = False,
+    include_pandora: bool = False, pandora_k_percent: float = 10.0,
+) -> dict[str, Any]:
+    """One batch-one model forward, followed by shared-logit score variants."""
+    import torch
+    if len(prepared.input_ids) > checkpoint.context_limit:
+        raise ValueError("Input exceeds model context; declare a prefix experiment explicitly.")
+    if prepared.original_token_ids is not None:
+        selected_source = prepared.original_token_ids[:len(prepared.input_ids) + 1]
+        if (prepared.input_mode != "checkmiabench_original_tokens" or
+                prepared.input_ids != selected_source[:-1] or
+                prepared.target_ids != selected_source[1:]):
+            raise ValueError("External targets must match the exact original causal source prefix.")
+    elif prepared.target_ids != prepared.input_ids[1:1 + len(prepared.target_ids)]:
+        raise ValueError("Prepared targets must be the contiguous causal input prefix after position zero.")
+    vocab = int(checkpoint.model.config.vocab_size)
+    if max(prepared.input_ids) >= vocab or max(prepared.target_ids) >= vocab:
+        raise ValueError("Input or target ID exceeds the loaded model vocabulary.")
+    _sync(checkpoint.device)
+    started = time.perf_counter()
+    tokens = torch.tensor([prepared.input_ids], dtype=torch.long, device=checkpoint.device)
+    with torch.inference_mode():
+        output = checkpoint.model(input_ids=tokens, attention_mask=torch.ones_like(tokens), use_cache=False)
+        logits = output.logits
+        if logits.ndim != 3 or logits.shape[:2] != tokens.shape:
+            raise ValueError("Model did not return a complete batch-one sequence of logits.")
+        _sync(checkpoint.device)
+        forwarded = time.perf_counter()
+        measurements = score_logits_variants(
+            logits[0, :len(prepared.target_ids), :], prepared.target_ids,
+            chunk_tokens=chunk_tokens, k_percent=k_percent, text=prepared.text,
+            include_cpu_float64=include_cpu_float64, include_pandora=include_pandora,
+            pandora_k_percent=pandora_k_percent,
+        )
+    _sync(checkpoint.device)
+    finished = time.perf_counter()
+    memory = _memory_snapshot(checkpoint.device)
+    del output, logits, tokens
+    return {
+        "engine_version": ENGINE_VERSION,
+        "author_source": AUTHOR_SOURCE,
+        "id": prepared.identifier,
+        "status": "complete" if all(value["status"] == "complete" for value in
+                                     [*measurements["variants"].values(), *measurements["pandora_comparators"].values()]) else "invalid_support",
+        "input_mode": prepared.input_mode,
+        "input_convention": prepared.convention,
+        "input_token_ids": list(prepared.input_ids),
+        "original_token_ids": list(prepared.original_token_ids) if prepared.original_token_ids is not None else None,
+        "input_token_ids_sha256": _digest_ids(prepared.input_ids),
+        "target_token_ids": list(prepared.target_ids),
+        "target_token_ids_sha256": _digest_ids(prepared.target_ids),
+        "target_sequence_positions": list(range(1, len(prepared.target_ids) + 1)),
+        "logit_positions": list(range(len(prepared.target_ids))),
+        "source_text_sha256": hashlib.sha256(prepared.text.encode("utf-8")).hexdigest() if prepared.text is not None else None,
+        "target_count": len(prepared.target_ids),
+        "batch_size": 1,
+        "attention_mask_convention": "all ones on every forwarded input position",
+        "checkpoint_identity": checkpoint.identity,
+        "timing": {"forward_seconds": forwarded - started, "statistics_and_serialization_seconds": finished - forwarded,
+                   "total_seconds": finished - started},
+        "memory": memory,
+        **measurements,
+    }
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--model-path", type=Path, required=True)
+    parser.add_argument("--input", type=Path, required=True)
+    parser.add_argument("--output", type=Path, required=True, help="New output directory; existing paths are rejected.")
+    parser.add_argument("--input-kind", choices=("olmo_plaintext", "checkmiabench_tokens"), required=True)
+    parser.add_argument("--device", choices=("cpu", "mps", "cuda"), default="mps")
+    parser.add_argument("--model-dtype", choices=("bfloat16", "float16", "float32"), default="bfloat16")
+    parser.add_argument("--attention-implementation", choices=("sdpa", "eager"), default="sdpa")
+    parser.add_argument("--max-tokens", type=int)
+    parser.add_argument("--chunk-tokens", type=int, default=64)
+    parser.add_argument("--k-percent", type=float, default=20.)
+    parser.add_argument("--limit", type=int)
+    parser.add_argument("--id-field", default="id")
+    parser.add_argument("--text-field", default="text")
+    parser.add_argument("--tokens-field", default="tokens")
+    parser.add_argument("--cpu-float64-diagnostic", action="store_true")
+    parser.add_argument("--include-pandora", action="store_true", help="Add explicitly named uniform-vocabulary same-forward comparators.")
+    parser.add_argument("--pandora-k-percent", type=float, default=10.)
+    parser.add_argument("--gzip-vectors", action="store_true")
+    args = parser.parse_args(argv)
+    if args.output.exists():
+        parser.error("Output directory already exists.")
+    if args.limit is not None and args.limit < 1:
+        parser.error("limit must be positive.")
+    # Merely importing this module or requesting --help never loads a model.
+    project = Path(__file__).resolve().parent.parent
+    if str(project) not in sys.path:
+        sys.path.insert(0, str(project))
+    payload = args.input.read_bytes()
+    records = [json.loads(line) for line in payload.decode("utf-8").splitlines() if line.strip()]
+    selected = records if args.limit is None else records[:args.limit]
+    if not selected:
+        parser.error("Input contains no records.")
+    args.output.mkdir(parents=True, exist_ok=False)
+    manifest = {
+        "engine_version": ENGINE_VERSION,
+        "engine_source_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        "input_file_sha256": hashlib.sha256(payload).hexdigest(),
+        "input_records": len(records), "selected_records": len(selected),
+        "settings": {name: str(value) if isinstance(value, Path) else value for name, value in vars(args).items()},
+        "versions": {name: importlib.metadata.version(name) for name in ("torch", "transformers", "numpy")},
+        "status": "running",
+    }
+    manifest_path = args.output / "execution.json"
+    manifest_path.write_bytes(_json_bytes(manifest) + b"\n")
+    count = 0
+    score_path: Path | None = None
+    started = time.perf_counter()
+    try:
+        checkpoint = load_local_checkpoint(args.model_path, device=args.device, model_dtype=args.model_dtype,
+                                           attention_implementation=args.attention_implementation)
+        filename = "scores.jsonl.gz" if args.gzip_vectors else "scores.jsonl"
+        score_path = args.output / filename
+        opener = gzip.open if args.gzip_vectors else open
+        with opener(score_path, "xb") as handle:
+            for index, record in enumerate(selected):
+                identifier = str(record.get(args.id_field, f"row-{index}"))
+                if args.input_kind == "olmo_plaintext":
+                    prepared = prepare_olmo_plaintext(checkpoint.tokenizer, record[args.text_field], identifier,
+                                                     max_tokens=args.max_tokens if args.max_tokens is not None else 4096)
+                else:
+                    prepared = prepare_checkmiabench_tokens(record[args.tokens_field], identifier,
+                        text=record.get(args.text_field), max_tokens=args.max_tokens)
+                result = score_prepared(checkpoint, prepared, chunk_tokens=args.chunk_tokens,
+                    k_percent=args.k_percent, include_cpu_float64=args.cpu_float64_diagnostic,
+                    include_pandora=args.include_pandora, pandora_k_percent=args.pandora_k_percent)
+                result["record_index"] = index
+                handle.write(_json_bytes(result) + b"\n")
+                handle.flush()
+                count += 1
+                print(f"Scored {count}/{len(selected)}: {identifier}", flush=True)
+                if result["status"] != "complete":
+                    raise ValueError(f"Invalid score support for {identifier}; vectors retained.")
+        manifest.update(status="complete", scored_records=count, wall_seconds=time.perf_counter() - started,
+                        checkpoint_identity=checkpoint.identity, score_file=filename)
+        print(f"Saved {count} real-input score records to {args.output}", flush=True)
+        return 0
+    except BaseException as error:
+        manifest.update(status="failed", scored_records=count, wall_seconds=time.perf_counter() - started,
+                        error_type=type(error).__name__, error=str(error))
+        raise
+    finally:
+        if score_path is not None and score_path.is_file():
+            manifest.update(score_file=score_path.name, score_file_sha256=_digest_file(score_path),
+                            score_file_bytes=score_path.stat().st_size)
+        manifest_path.write_bytes(_json_bytes(manifest) + b"\n")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
