@@ -209,3 +209,80 @@ def download_missing(path, expected, url, *, root, timeout):
         os.link(partial, path)
     finally:
         partial.unlink(missing_ok=True)
+
+
+def validate_members(members, expected_root):
+    if len(members) > 10000 or sum(m.size for m in members if m.isfile()) > 512 * 1024 * 1024:
+        raise ValueError("Archive exceeds this source's declared extraction limits")
+    paths, casefolded = {}, set()
+    for member in members:
+        name = member.name.rstrip("/")
+        if (not name or "\\" in name or "\x00" in name or ":" in name or PurePosixPath(name).is_absolute()
+                or PureWindowsPath(name).drive):
+            raise ValueError(f"Unsafe archive path: {member.name}")
+        parts = name.split("/")
+        if parts[0] != expected_root or any(p in ("", ".", "..") for p in parts):
+            raise ValueError(f"Archive path escapes expected source: {member.name}")
+        if not (member.isfile() or member.isdir()):
+            raise ValueError(f"Archive links/special files are not accepted: {member.name}")
+        if name.casefold() in casefolded:
+            raise ValueError(f"Repeated/case-colliding archive path: {member.name}")
+        casefolded.add(name.casefold())
+        paths[name] = member
+    folded_paths = {name.casefold(): member for name, member in paths.items()}
+    for name in paths:
+        for parent in PurePosixPath(name).parents:
+            if str(parent).casefold() in folded_paths and folded_paths[str(parent).casefold()].isfile():
+                raise ValueError(f"Archive file is also a parent path: {parent}")
+    return paths
+
+
+def extract_new_archive(archive, destination, expected_root):
+    """Validate every member first, then write only into a newly reserved dir."""
+    with tarfile.open(archive, "r:gz") as source:
+        members = source.getmembers()
+        paths = validate_members(members, expected_root)
+        # Exist_ok=False also rejects a concurrent destination, links or files.
+        destination.mkdir(parents=False, exist_ok=False)
+        for name, member in paths.items():
+            relative = PurePosixPath(name).relative_to(expected_root)
+            target = destination.joinpath(*relative.parts)
+            if member.isdir():
+                target.mkdir(parents=True, exist_ok=True)
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            contents = source.extractfile(member)
+            if contents is None:
+                raise ValueError(f"Missing archive content: {name}")
+            with target.open("xb") as output:
+                for chunk in iter(lambda: contents.read(1024 * 1024), b""):
+                    output.write(chunk)
+    # Partial new directories survive failures, so they cannot be mistaken for
+    # a verified tree or silently overwritten by a later invocation.
+
+
+def verify_archive_tree(archive, destination, expected_root):
+    with tarfile.open(archive, "r:gz") as source:
+        paths = validate_members(source.getmembers(), expected_root)
+        expected_files = {str(PurePosixPath(name).relative_to(expected_root)): member
+                          for name, member in paths.items() if member.isfile()}
+        if not destination.is_dir() or destination.is_symlink():
+            return {"status": "missing" if not destination.exists() else "invalid_type", "path": str(destination)}
+        observed_files = set()
+        for path in destination.rglob("*"):
+            if path.is_symlink():
+                raise ValueError(f"Unexpected symlink in extracted source tree: {path}")
+            if path.is_file():
+                observed_files.add(path.relative_to(destination).as_posix())
+        if observed_files != set(expected_files):
+            return {"status": "tree_file_set_mismatch", "missing": sorted(set(expected_files) - observed_files),
+                    "unexpected": sorted(observed_files - set(expected_files)), "path": str(destination)}
+        for relative, member in expected_files.items():
+            path = destination / relative
+            contents = source.extractfile(member)
+            h = hashlib.sha256()
+            for chunk in iter(lambda: contents.read(1024 * 1024), b""):
+                h.update(chunk)
+            if path.stat().st_size != member.size or file_hash(path) != h.hexdigest():
+                return {"status": "tree_content_mismatch", "path": str(path)}
+    return {"status": "verified", "path": str(destination), "files": len(expected_files)}
