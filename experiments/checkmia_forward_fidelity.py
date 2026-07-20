@@ -277,3 +277,139 @@ def verified_reference(study_run: Path, sealed_data: Path) -> dict[str, Any]:
     return {"execution": execution, "reference": reference, "reference_raw": raw,
             "source": source, "receipt": receipt, "mps_required_support": support,
             "reference_shard": matching[0], "reference_record_sha256": link["uncompressed_record_sha256"]}
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--study-run", type=Path, required=True, help="Complete amended 3,000-record run; its process must have exited.")
+    parser.add_argument("--sealed-data", type=Path, required=True)
+    parser.add_argument("--model-path", type=Path, required=True)
+    parser.add_argument("--output", type=Path, required=True, help="New output directory; existing evidence is never overwritten.")
+    args = parser.parse_args(argv)
+    if args.output.exists():
+        parser.error("Output must be a new directory.")
+    args.output.mkdir(parents=True, exist_ok=False)
+    manifest: dict[str, Any] = {
+        "status": "preflight", "record_id": RECORD_ID, "learned_model_forwards_planned": 1,
+        "learned_model_forwards_attempted": 0, "device": "cpu", "model_dtype": "float16",
+        "threshold": None, "python": sys.version, "platform": platform.platform(),
+        "versions": {name: importlib.metadata.version(name) for name in ("torch", "transformers", "numpy")},
+        "scope": "One observed dev record; CPU/MPS execution fidelity, not membership or full-logit parity.",
+        "statistics_controls": "FP32 device sections mix forward and scoring-kernel effects. CPU-FP64 centered sections hold statistics device/dtype/function fixed across both forward outputs.",
+        "cpu_float64_diagnostic_requested": True,
+        "timing_limit": "Both records include CPU-FP64 statistics, but this single first-record comparison is not a controlled CPU/MPS throughput benchmark.",
+        "settings": {key: str(value.resolve()) for key, value in vars(args).items()},
+        "files_sha256": {}, "timing": {},
+    }
+    execution_path = args.output / "execution.json"
+    execution_path.write_bytes(encoded(manifest))
+    started = time.perf_counter()
+    checkpoint = None
+    try:
+        verified = verified_reference(args.study_run, args.sealed_data)
+        for dependency in ("torch", "transformers", "numpy"):
+            require(manifest["versions"][dependency] == verified["execution"]["versions"][dependency],
+                    f"Device comparison environment drift: {dependency}.")
+        manifest["timing"]["reference_preflight_seconds"] = time.perf_counter() - started
+        for source, destination in (
+            (Path(__file__), "checkmia_forward_fidelity.py"),
+            (args.study_run / "real_score_engine.py", "real_score_engine.py"),
+            (args.study_run / "checkmia_real_scoring.py", "study_scoring_source.py"),
+            (args.study_run / "checkmia_real_analysis.py", "study_analysis_source.py"),
+            (args.study_run / "execution.json", "mps_execution.json"),
+            (args.sealed_data / "seal.json", "data_seal.json"),
+            (args.sealed_data / "protocol.json", "protocol.json"),
+            (args.sealed_data / "download_receipts.json", "download_receipts.json"),
+            (PROJECT / "contamcheckr/hashing.py", "hashing_source.py"),
+            (PROJECT / "docs/CHECKMIA_FORWARD_FIDELITY_PLAN.md", "fidelity_plan.md"),
+        ):
+            shutil.copy2(source, args.output / destination)
+        require(sha_file(args.study_run / "checkmia_real_scoring.py") ==
+                verified["execution"]["source_sha256"]["checkmia_real_scoring.py"], "Frozen study runner changed.")
+        if "amendment_sha256" in verified["execution"]:
+            amendment = args.study_run / "amendment.json"
+            require(sha_file(amendment) == verified["execution"]["amendment_sha256"], "Amendment changed.")
+            shutil.copy2(amendment, args.output / "amendment.json")
+        (args.output / "input.jsonl").write_bytes(encoded(verified["source"]))
+        with gzip.open(args.output / "mps_reference.jsonl.gz", "xb", compresslevel=1) as handle:
+            handle.write(verified["reference_raw"])
+        manifest.update(reference_record_sha256=verified["reference_record_sha256"],
+                        reference_shard=verified["reference_shard"], model_repo=MODEL_REPO,
+                        model_revision=MODEL_REVISION, engine_source_sha256=ENGINE_SHA256,
+                        mps_checkpoint_identity=verified["reference"]["checkpoint_identity"],
+                        mps_required_support=verified["mps_required_support"])
+        phase = time.perf_counter()
+        manifest["model_files_verified_before_load"] = verify_model(args.model_path, verified["receipt"])
+        manifest["timing"]["model_hash_verification_seconds"] = time.perf_counter() - phase
+        manifest["status"] = "verified_before_cpu_model_load"
+        execution_path.write_bytes(encoded(manifest))
+        print(json.dumps({"stage": "loading_single_cpu_checkpoint", "record_id": RECORD_ID}), flush=True)
+        if str(PROJECT) not in sys.path:
+            sys.path.insert(0, str(PROJECT))
+        # Execute only our already reviewed, hash-pinned local engine copy.
+        spec = importlib.util.spec_from_file_location("checkmia_frozen_fidelity_engine", args.output / "real_score_engine.py")
+        require(spec is not None and spec.loader is not None, "Cannot load the frozen local scoring engine.")
+        engine = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = engine
+        spec.loader.exec_module(engine)
+        phase = time.perf_counter()
+        checkpoint = engine.load_local_checkpoint(args.model_path, device="cpu", model_dtype="float16",
+                                                 attention_implementation="sdpa", seed=42)
+        manifest["timing"]["cpu_model_load_seconds"] = time.perf_counter() - phase
+        identity = checkpoint.identity
+        require(identity["device"].startswith("cpu") and identity["model_dtype"] == "torch.float16"
+                and identity["context_limit"] == 2048 and identity["resolved_attention_implementation"] == "sdpa",
+                "CPU model did not resolve the fixed dtype/context/attention convention.")
+        require(identity["tokenizer_fingerprint"] == verified["reference"]["checkpoint_identity"]["tokenizer_fingerprint"],
+                "CPU and MPS tokenizer identity differs.")
+        manifest["cpu_checkpoint_identity"] = identity
+        manifest["status"] = "scoring_single_cpu_record"
+        manifest["learned_model_forwards_attempted"] = 1
+        execution_path.write_bytes(encoded(manifest))
+        print(json.dumps({"stage": "scoring_single_cpu_dev_record", "record_id": RECORD_ID}), flush=True)
+        row = verified["source"]
+        prepared = engine.prepare_checkmiabench_tokens(row["tokens"], RECORD_ID, text=row["text"])
+        require(len(prepared.input_ids) == len(prepared.target_ids) == 2048, "Unexpected forwarded input/target count.")
+        cpu = engine.score_prepared(checkpoint, prepared, chunk_tokens=64, k_percent=10,
+                                    include_pandora=True, pandora_k_percent=10, include_cpu_float64=True)
+        cpu["source"] = {key: value for key, value in row.items() if key not in {"text", "tokens"}}
+        with gzip.open(args.output / "cpu_result.jsonl.gz", "xb", compresslevel=1) as handle:
+            handle.write(encoded(cpu))
+        require(cpu["forward_logit_dtype"] == verified["reference"]["forward_logit_dtype"] == "torch.float16",
+                "Returned CPU/MPS forward-logit dtypes differ from the fixed FP16 convention; CPU result retained.")
+        manifest["cpu_required_support"] = full_fp32_support(cpu)
+        manifest["cpu_required_support"][f"variants/{CPU64_VARIANT}"] = full_cpu64_support(cpu)
+        comparison = compare_records(cpu, verified["reference"])
+        (args.output / "comparison.json").write_bytes(encoded(comparison))
+        require(comparison["required_comparison_complete"],
+                "CPU result has incomplete required FP32/CPU-FP64 support or convention; full record retained.")
+        checkpoint = None
+        manifest["model_files_verified_after_score"] = verify_model(args.model_path, verified["receipt"])
+        require(sha_file(args.study_run / "execution.json") == sha_file(args.output / "mps_execution.json"),
+                "Reference execution changed during the CPU comparison.")
+        require(sha_file(args.output / "real_score_engine.py") == ENGINE_SHA256
+                and sha_file(PROJECT / "experiments/real_score_engine.py") == ENGINE_SHA256,
+                "Scoring engine changed during the CPU comparison.")
+        require(sha_file(Path(__file__)) == sha_file(args.output / "checkmia_forward_fidelity.py"),
+                "Fidelity source changed during execution.")
+        require(sha_file(PROJECT / "contamcheckr/hashing.py") == sha_file(args.output / "hashing_source.py"),
+                "Identity helper changed during execution.")
+        require(sha_file(PROJECT / "docs/CHECKMIA_FORWARD_FIDELITY_PLAN.md") == sha_file(args.output / "fidelity_plan.md"),
+                "Fidelity interpretation plan changed during execution.")
+        manifest["status"] = "complete_required_fp32_and_cpu64_no_acceptance_threshold"
+        print(json.dumps({"output": str(args.output), "record_id": RECORD_ID,
+                          "status": manifest["status"], "comparison": str(args.output / "comparison.json")}), flush=True)
+        return 0
+    except BaseException as error:
+        manifest.update(status="failed", error_type=type(error).__name__, error=str(error))
+        raise
+    finally:
+        checkpoint = None
+        manifest["timing"]["total_wall_seconds"] = time.perf_counter() - started
+        manifest["files_sha256"] = {path.name: sha_file(path) for path in sorted(args.output.iterdir())
+                                    if path.is_file() and path.name != "execution.json"}
+        execution_path.write_bytes(encoded(manifest))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
